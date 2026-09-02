@@ -18,6 +18,7 @@ clique para salvar.
 """
 
 import os
+import html
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -222,7 +223,7 @@ COLUNAS_MUSCULACAO = [
 ]
 COLUNAS_CORRIDA = [
     "data", "distancia_prescrita_km", "tempo_prescrito_min",
-    "distancia_real_km", "tempo_real_min", "pace_real",
+    "distancia_real_km", "tempo_real_min", "pace_real", "comentarios",
 ]
 COLUNAS_DIETA = [
     "data", "refeicao", "prescrito", "alimento_consumido",
@@ -362,26 +363,35 @@ def salvar_prescricao_corrida(data_ref, distancia, tempo):
             "data": data_ref,
             "distancia_prescrita_km": distancia, "tempo_prescrito_min": tempo,
             "distancia_real_km": np.nan, "tempo_real_min": np.nan, "pace_real": np.nan,
+            "comentarios": np.nan,
         }
         st.session_state["corrida"] = pd.concat([df, pd.DataFrame([nova_linha])], ignore_index=True)
 
     salvar_dados_disco()
 
 
-def salvar_realizado_corrida(data_ref, distancia, tempo):
-    """Registra a corrida realizada, calculando o pace (min/km) automaticamente."""
+def salvar_realizado_corrida(data_ref, distancia, tempo, comentarios=""):
+    """
+    Registra a corrida realizada, calculando o pace (min/km) automaticamente
+    e salvando a descrição/comentários livres do treino (sensação, terreno,
+    tipo de treino etc.).
+    """
     pace = tempo / distancia if distancia > 0 else np.nan
+    comentarios = comentarios.strip() if isinstance(comentarios, str) else comentarios
     df = st.session_state["corrida"]
     filtro = df["data"] == data_ref
 
     if filtro.any():
         idx = df[filtro].index[0]
-        df.loc[idx, ["distancia_real_km", "tempo_real_min", "pace_real"]] = [distancia, tempo, pace]
+        df.loc[idx, ["distancia_real_km", "tempo_real_min", "pace_real", "comentarios"]] = [
+            distancia, tempo, pace, comentarios,
+        ]
     else:
         nova_linha = {
             "data": data_ref,
             "distancia_prescrita_km": np.nan, "tempo_prescrito_min": np.nan,
             "distancia_real_km": distancia, "tempo_real_min": tempo, "pace_real": pace,
+            "comentarios": comentarios,
         }
         st.session_state["corrida"] = pd.concat([df, pd.DataFrame([nova_linha])], ignore_index=True)
 
@@ -740,12 +750,17 @@ def pagina_diario():
             col1, col2 = st.columns(2)
             dist_r = col1.number_input("Distância realizada (km)", min_value=0.0, step=0.1, value=0.0, key="dr")
             tempo_r = col2.number_input("Tempo realizado (min)", min_value=0.0, step=1.0, value=0.0, key="tr")
+            comentarios_r = st.text_area(
+                "Descrição do Treino / Comentários",
+                placeholder="Ex: Treino de tiros, sensação de cansaço, terreno com aclive...",
+                key="comentarios_corrida",
+            )
             enviado_r = st.form_submit_button("Registrar corrida", use_container_width=True)
             if enviado_r:
                 if dist_r <= 0:
                     st.error("Informe uma distância maior que zero.")
                 else:
-                    pace = salvar_realizado_corrida(data_selecionada, dist_r, tempo_r)
+                    pace = salvar_realizado_corrida(data_selecionada, dist_r, tempo_r, comentarios_r)
                     st.success(f"Corrida registrada. Pace calculado: {pace:.2f} min/km")
                     st.rerun()
 
@@ -765,6 +780,18 @@ def pagina_diario():
             )
             c2.metric("Tempo", f"{linha.get('tempo_real_min', np.nan):.0f} min" if pd.notna(linha.get("tempo_real_min")) else "—")
             c3.metric("Pace", f"{linha.get('pace_real', np.nan):.2f} min/km" if pd.notna(linha.get("pace_real")) else "—")
+
+            comentario_txt = linha.get("comentarios", "")
+            if isinstance(comentario_txt, str) and comentario_txt.strip():
+                st.markdown(
+                    f"""
+                    <div class="fh-card" style="margin-top:0.8rem;">
+                        <h4>Descrição do treino</h4>
+                        <p style="white-space:pre-wrap;">{html.escape(comentario_txt.strip())}</p>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
 
     # ------------------------------------------------------------------
     # SUB-ABA DIETA
@@ -951,6 +978,30 @@ def pagina_evolucao():
             plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", font_color="#F2F4F8",
         )
         st.plotly_chart(fig_corrida, use_container_width=True)
+
+    # ------------------------------------------------------------------
+    # COMENTÁRIOS DOS TREINOS DE CORRIDA
+    # ------------------------------------------------------------------
+    titulo_secao("Descrições de treino", subtitulo="Comentários registrados nas corridas mais recentes.")
+    comentarios_corrida = df_corrida[
+        df_corrida["comentarios"].notna() & (df_corrida["comentarios"].astype(str).str.strip() != "")
+    ].sort_values("data", ascending=False)
+
+    if comentarios_corrida.empty:
+        st.info("Nenhum comentário de treino registrado ainda.")
+    else:
+        for _, linha_c in comentarios_corrida.head(10).iterrows():
+            data_fmt = pd.to_datetime(linha_c["data"]).strftime("%d/%m/%Y")
+            dist_fmt = f"{linha_c['distancia_real_km']:.2f} km" if pd.notna(linha_c.get("distancia_real_km")) else "—"
+            st.markdown(
+                f"""
+                <div class="fh-card">
+                    <h4>{data_fmt} · {dist_fmt}</h4>
+                    <p style="white-space:pre-wrap;">{html.escape(str(linha_c["comentarios"]).strip())}</p>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
     # ------------------------------------------------------------------
     # GRÁFICO 3: CONSUMO CALÓRICO DIÁRIO VS META
