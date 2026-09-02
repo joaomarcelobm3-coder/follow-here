@@ -587,7 +587,7 @@ def pagina_inicio():
     with c2:
         cartao_kpi("Refeições registradas", int(total_refeicoes), "blue")
     with c3:
-        cartao_kpi("Km rodados (total)", f"{total_km:.1f} km", "warn")
+        cartao_kpi("Km rodados (total)", f"{total_km} km", "warn")
 
     if total_treinos == 0 and total_refeicoes == 0 and total_km == 0:
         st.info("Você ainda não tem registros. Acesse o **Diário** para começar.")
@@ -654,7 +654,7 @@ def pagina_diario():
                 column_config={
                     "Séries": st.column_config.NumberColumn(min_value=0, step=1),
                     "Repetições": st.column_config.NumberColumn(min_value=0, step=1),
-                    "Carga (kg)": st.column_config.NumberColumn(min_value=0.0, step=0.5, format="%.1f"),
+                    "Carga (kg)": st.column_config.NumberColumn(min_value=0.0, step=0.5),
                 },
             )
             if st.button("Salvar treino prescrito", use_container_width=True, key="btn_salvar_prescrito_musc"):
@@ -689,7 +689,7 @@ def pagina_diario():
                 column_config={
                     "Séries": st.column_config.NumberColumn(min_value=0, step=1),
                     "Repetições": st.column_config.NumberColumn(min_value=0, step=1),
-                    "Carga (kg)": st.column_config.NumberColumn(min_value=0.0, step=0.5, format="%.1f"),
+                    "Carga (kg)": st.column_config.NumberColumn(min_value=0.0, step=0.5),
                 },
             )
             if st.button("Salvar treino realizado", use_container_width=True, key="btn_salvar_realizado_musc"):
@@ -702,18 +702,17 @@ def pagina_diario():
                     st.rerun()
 
         st.markdown("---")
-        titulo_secao("Comparativo do dia", subtitulo="Prescrito ao lado do realizado, exercício por exercício.")
+        titulo_secao("Comparativo do dia", subtitulo="Planejado, realizado e a diferença entre os dois, exercício por exercício.")
         registros_dia = df_musc[df_musc["data"] == data_selecionada]
         if registros_dia.empty:
             st.info("Nenhum dado de musculação para esta data.")
         else:
-            tabela = registros_dia[[
-                "exercicio", "series_prescritas", "series_realizadas",
-                "carga_prescrita", "carga_realizada",
-            ]].rename(columns={
+            tabela = registros_dia[["exercicio", "carga_prescrita", "carga_realizada"]].copy()
+            tabela["diferenca"] = tabela["carga_realizada"] - tabela["carga_prescrita"]
+            tabela = tabela.rename(columns={
                 "exercicio": "Exercício",
-                "series_prescritas": "Séries Presc.", "series_realizadas": "Séries Real.",
-                "carga_prescrita": "Carga Presc.", "carga_realizada": "Carga Real.",
+                "carga_prescrita": "Planejado (kg)", "carga_realizada": "Realizado (kg)",
+                "diferenca": "Diferença (kg)",
             })
             st.dataframe(tabela, use_container_width=True, hide_index=True)
 
@@ -730,8 +729,8 @@ def pagina_diario():
         else:
             linha = meta_dia.iloc[0]
             c1, c2 = st.columns(2)
-            c1.metric("Distância prescrita", f"{linha['distancia_prescrita_km']:.1f} km")
-            c2.metric("Tempo prescrito", f"{linha['tempo_prescrito_min']:.0f} min")
+            c1.metric("Distância prescrita", f"{linha['distancia_prescrita_km']} km")
+            c2.metric("Tempo prescrito", f"{linha['tempo_prescrito_min']} min")
 
         with st.expander("Cadastrar / editar meta de corrida"):
             with st.form("form_prescricao_corrida", clear_on_submit=True):
@@ -761,25 +760,37 @@ def pagina_diario():
                     st.error("Informe uma distância maior que zero.")
                 else:
                     pace = salvar_realizado_corrida(data_selecionada, dist_r, tempo_r, comentarios_r)
-                    st.success(f"Corrida registrada. Pace calculado: {pace:.2f} min/km")
+                    st.success(f"Corrida registrada. Pace calculado: {pace} min/km")
                     st.rerun()
 
         st.markdown("---")
-        titulo_secao("Comparativo do dia")
+        titulo_secao("Comparativo do dia", subtitulo="Planejado, realizado e a diferença exata entre os dois.")
         registro_corrida_dia = df_corrida[df_corrida["data"] == data_selecionada]
         if registro_corrida_dia.empty:
             st.info("Nenhum dado de corrida para esta data.")
         else:
             linha = registro_corrida_dia.iloc[0]
-            c1, c2, c3 = st.columns(3)
-            c1.metric(
-                "Distância",
-                f"{linha.get('distancia_real_km', np.nan):.2f} km" if pd.notna(linha.get("distancia_real_km")) else "—",
-                delta=(f"{(linha['distancia_real_km'] - linha['distancia_prescrita_km']):.2f} km"
-                       if pd.notna(linha.get("distancia_real_km")) and pd.notna(linha.get("distancia_prescrita_km")) else None),
-            )
-            c2.metric("Tempo", f"{linha.get('tempo_real_min', np.nan):.0f} min" if pd.notna(linha.get("tempo_real_min")) else "—")
-            c3.metric("Pace", f"{linha.get('pace_real', np.nan):.2f} min/km" if pd.notna(linha.get("pace_real")) else "—")
+            dist_p, dist_r = linha.get("distancia_prescrita_km"), linha.get("distancia_real_km")
+            tempo_p_v, tempo_r_v = linha.get("tempo_prescrito_min"), linha.get("tempo_real_min")
+
+            tabela_corrida = pd.DataFrame([
+                {
+                    "Métrica": "Distância (km)",
+                    "Planejado": dist_p if pd.notna(dist_p) else "—",
+                    "Realizado": dist_r if pd.notna(dist_r) else "—",
+                    "Diferença": (dist_r - dist_p) if pd.notna(dist_r) and pd.notna(dist_p) else "—",
+                },
+                {
+                    "Métrica": "Tempo (min)",
+                    "Planejado": tempo_p_v if pd.notna(tempo_p_v) else "—",
+                    "Realizado": tempo_r_v if pd.notna(tempo_r_v) else "—",
+                    "Diferença": (tempo_r_v - tempo_p_v) if pd.notna(tempo_r_v) and pd.notna(tempo_p_v) else "—",
+                },
+            ])
+            st.dataframe(tabela_corrida, use_container_width=True, hide_index=True)
+
+            pace_v = linha.get("pace_real")
+            st.metric("Pace realizado", f"{pace_v} min/km" if pd.notna(pace_v) else "—")
 
             comentario_txt = linha.get("comentarios", "")
             if isinstance(comentario_txt, str) and comentario_txt.strip():
@@ -826,7 +837,7 @@ def pagina_diario():
                 key="editor_dieta_prescrito",
                 disabled=["Refeição"],
                 column_config={
-                    "Calorias (kcal)": st.column_config.NumberColumn(min_value=0.0, step=10.0, format="%.0f"),
+                    "Calorias (kcal)": st.column_config.NumberColumn(min_value=0.0, step=10.0),
                 },
             )
             if st.button("Salvar dieta prescrita", use_container_width=True, key="btn_salvar_prescrito_dieta"):
@@ -852,8 +863,8 @@ def pagina_diario():
                 key="editor_dieta_realizado",
                 disabled=["Refeição"],
                 column_config={
-                    "Qtd (g)": st.column_config.NumberColumn(min_value=0.0, step=10.0, format="%.0f"),
-                    "Calorias (kcal)": st.column_config.NumberColumn(min_value=0.0, step=10.0, format="%.0f"),
+                    "Qtd (g)": st.column_config.NumberColumn(min_value=0.0, step=10.0),
+                    "Calorias (kcal)": st.column_config.NumberColumn(min_value=0.0, step=10.0),
                 },
             )
             if st.button("Salvar consumo real", use_container_width=True, key="btn_salvar_realizado_dieta"):
@@ -862,15 +873,17 @@ def pagina_diario():
                 st.rerun()
 
         st.markdown("---")
-        titulo_secao("Comparativo do dia")
+        titulo_secao("Comparativo do dia", subtitulo="Planejado, realizado e a diferença exata entre os dois.")
         registros_dieta_dia = df_dieta[df_dieta["data"] == data_selecionada]
         if registros_dieta_dia.empty:
             st.info("Nenhum dado de dieta para esta data.")
         else:
-            tabela = registros_dieta_dia[[
-                "refeicao", "calorias_prescritas", "calorias_consumidas",
-            ]].rename(columns={
-                "refeicao": "Refeição", "calorias_prescritas": "Kcal Presc.", "calorias_consumidas": "Kcal Real.",
+            tabela = registros_dieta_dia[["refeicao", "calorias_prescritas", "calorias_consumidas"]].copy()
+            tabela["diferenca"] = tabela["calorias_consumidas"] - tabela["calorias_prescritas"]
+            tabela = tabela.rename(columns={
+                "refeicao": "Refeição",
+                "calorias_prescritas": "Planejado (kcal)", "calorias_consumidas": "Realizado (kcal)",
+                "diferenca": "Diferença (kcal)",
             })
             st.dataframe(tabela, use_container_width=True, hide_index=True)
 
@@ -895,15 +908,58 @@ def pagina_evolucao():
     df_dieta = st.session_state["dieta"].copy()
 
     # ------------------------------------------------------------------
-    # HISTÓRICO COMPLETO EM TABELAS
+    # HISTÓRICO COMPARATIVO: PLANEJADO x REALIZADO x DIFERENÇA
     # ------------------------------------------------------------------
-    with st.expander("Histórico completo (tabelas)", expanded=False):
+    with st.expander("Histórico completo — Planejado vs. Realizado", expanded=False):
         st.markdown("**Musculação**")
-        st.dataframe(df_musc, use_container_width=True, hide_index=True)
+        tabela_musc_hist = df_musc[["data", "exercicio", "carga_prescrita", "carga_realizada"]].copy()
+        tabela_musc_hist["diferenca"] = tabela_musc_hist["carga_realizada"] - tabela_musc_hist["carga_prescrita"]
+        tabela_musc_hist = tabela_musc_hist.sort_values("data", ascending=False).rename(columns={
+            "data": "Data", "exercicio": "Exercício",
+            "carga_prescrita": "Planejado (kg)", "carga_realizada": "Realizado (kg)",
+            "diferenca": "Diferença (kg)",
+        })
+        st.dataframe(tabela_musc_hist, use_container_width=True, hide_index=True)
+
         st.markdown("**Corrida**")
-        st.dataframe(df_corrida, use_container_width=True, hide_index=True)
+        tabela_corrida_hist = df_corrida[[
+            "data", "distancia_prescrita_km", "distancia_real_km",
+            "tempo_prescrito_min", "tempo_real_min", "pace_real", "comentarios",
+        ]].copy()
+        tabela_corrida_hist["diferenca_distancia"] = (
+            tabela_corrida_hist["distancia_real_km"] - tabela_corrida_hist["distancia_prescrita_km"]
+        )
+        tabela_corrida_hist["diferenca_tempo"] = (
+            tabela_corrida_hist["tempo_real_min"] - tabela_corrida_hist["tempo_prescrito_min"]
+        )
+        tabela_corrida_hist = tabela_corrida_hist.sort_values("data", ascending=False).rename(columns={
+            "data": "Data",
+            "distancia_prescrita_km": "Distância Planejada (km)", "distancia_real_km": "Distância Realizada (km)",
+            "diferenca_distancia": "Diferença Distância (km)",
+            "tempo_prescrito_min": "Tempo Planejado (min)", "tempo_real_min": "Tempo Realizado (min)",
+            "diferenca_tempo": "Diferença Tempo (min)",
+            "pace_real": "Pace (min/km)", "comentarios": "Descrição do Treino",
+        })
+        st.dataframe(
+            tabela_corrida_hist[[
+                "Data", "Distância Planejada (km)", "Distância Realizada (km)", "Diferença Distância (km)",
+                "Tempo Planejado (min)", "Tempo Realizado (min)", "Diferença Tempo (min)",
+                "Pace (min/km)", "Descrição do Treino",
+            ]],
+            use_container_width=True, hide_index=True,
+        )
+
         st.markdown("**Dieta**")
-        st.dataframe(df_dieta, use_container_width=True, hide_index=True)
+        tabela_dieta_hist = df_dieta[["data", "refeicao", "calorias_prescritas", "calorias_consumidas"]].copy()
+        tabela_dieta_hist["diferenca"] = (
+            tabela_dieta_hist["calorias_consumidas"] - tabela_dieta_hist["calorias_prescritas"]
+        )
+        tabela_dieta_hist = tabela_dieta_hist.sort_values("data", ascending=False).rename(columns={
+            "data": "Data", "refeicao": "Refeição",
+            "calorias_prescritas": "Planejado (kcal)", "calorias_consumidas": "Realizado (kcal)",
+            "diferenca": "Diferença (kcal)",
+        })
+        st.dataframe(tabela_dieta_hist, use_container_width=True, hide_index=True)
 
     # ------------------------------------------------------------------
     # KPIs DE ADESÃO
@@ -926,11 +982,11 @@ def pagina_evolucao():
 
     k1, k2, k3 = st.columns(3)
     with k1:
-        cartao_kpi("Adesão à Musculação", f"{adesao_treino:.0f}%", "accent")
+        cartao_kpi("Adesão à Musculação", f"{adesao_treino}%", "accent")
     with k2:
-        cartao_kpi("Adesão à Corrida", f"{adesao_corrida:.0f}%", "blue")
+        cartao_kpi("Adesão à Corrida", f"{adesao_corrida}%", "blue")
     with k3:
-        cartao_kpi("Adesão à Dieta", f"{adesao_dieta:.0f}%", "warn")
+        cartao_kpi("Adesão à Dieta", f"{adesao_dieta}%", "warn")
 
     st.markdown("---")
 
@@ -992,7 +1048,7 @@ def pagina_evolucao():
     else:
         for _, linha_c in comentarios_corrida.head(10).iterrows():
             data_fmt = pd.to_datetime(linha_c["data"]).strftime("%d/%m/%Y")
-            dist_fmt = f"{linha_c['distancia_real_km']:.2f} km" if pd.notna(linha_c.get("distancia_real_km")) else "—"
+            dist_fmt = f"{linha_c['distancia_real_km']} km" if pd.notna(linha_c.get("distancia_real_km")) else "—"
             st.markdown(
                 f"""
                 <div class="fh-card">
@@ -1063,7 +1119,7 @@ def pagina_evolucao():
                 )
                 st.plotly_chart(fig_prev, use_container_width=True)
                 tendencia_texto = "crescente" if coef > 0 else ("decrescente" if coef < 0 else "estável")
-                st.caption(f"Tendência {tendencia_texto} de aproximadamente {coef:.3f} kg/dia.")
+                st.caption(f"Tendência {tendencia_texto} de aproximadamente {coef} kg/dia.")
 
     with col_previsao_corrida:
         st.markdown("**Corrida — projeção de distância**")
@@ -1089,7 +1145,7 @@ def pagina_evolucao():
                 )
                 st.plotly_chart(fig_prev_corrida, use_container_width=True)
                 tendencia_texto_c = "crescente" if coef_corrida > 0 else ("decrescente" if coef_corrida < 0 else "estável")
-                st.caption(f"Tendência {tendencia_texto_c} de aproximadamente {coef_corrida:.3f} km/dia.")
+                st.caption(f"Tendência {tendencia_texto_c} de aproximadamente {coef_corrida} km/dia.")
 
     st.markdown("---")
 
@@ -1108,19 +1164,19 @@ def pagina_evolucao():
         if mae_carga is None:
             st.caption(f"Registros pareados insuficientes ({n_carga}/3).")
         else:
-            st.write(f"MAE: {mae_carga:.2f} kg  \nRMSE: {rmse_carga:.2f} kg")
+            st.write(f"MAE: {mae_carga} kg  \nRMSE: {rmse_carga} kg")
     with e2:
         st.markdown("**Distância (corrida)**")
         if mae_dist is None:
             st.caption(f"Registros pareados insuficientes ({n_dist}/3).")
         else:
-            st.write(f"MAE: {mae_dist:.2f} km  \nRMSE: {rmse_dist:.2f} km")
+            st.write(f"MAE: {mae_dist} km  \nRMSE: {rmse_dist} km")
     with e3:
         st.markdown("**Calorias (dieta)**")
         if mae_cal is None:
             st.caption(f"Registros pareados insuficientes ({n_cal}/3).")
         else:
-            st.write(f"MAE: {mae_cal:.0f} kcal  \nRMSE: {rmse_cal:.0f} kcal")
+            st.write(f"MAE: {mae_cal} kcal  \nRMSE: {rmse_cal} kcal")
 
     st.markdown("---")
 
@@ -1150,27 +1206,27 @@ def pagina_evolucao():
         if soma_prescrita > 0:
             variacao = (soma_consumida - soma_prescrita) / soma_prescrita * 100
             if variacao > 10:
-                mensagens.append(("warning", f"Seu consumo calórico está {variacao:.0f}% acima do prescrito."))
+                mensagens.append(("warning", f"Seu consumo calórico está {variacao}% acima do prescrito."))
             elif variacao < -10:
-                mensagens.append(("warning", f"Seu consumo calórico está {abs(variacao):.0f}% abaixo do prescrito."))
+                mensagens.append(("warning", f"Seu consumo calórico está {abs(variacao)}% abaixo do prescrito."))
             else:
                 mensagens.append(("success", "Seu consumo calórico está alinhado com o prescrito."))
 
     if dias_com_treino_prescrito > 0:
         if adesao_treino >= 80:
-            mensagens.append(("success", f"Excelente adesão à musculação: {adesao_treino:.0f}% dos treinos cumpridos."))
+            mensagens.append(("success", f"Excelente adesão à musculação: {adesao_treino}% dos treinos cumpridos."))
         elif adesao_treino >= 50:
-            mensagens.append(("info", f"Adesão moderada à musculação: {adesao_treino:.0f}% dos treinos cumpridos."))
+            mensagens.append(("info", f"Adesão moderada à musculação: {adesao_treino}% dos treinos cumpridos."))
         else:
-            mensagens.append(("warning", f"Baixa adesão à musculação: apenas {adesao_treino:.0f}% dos treinos cumpridos."))
+            mensagens.append(("warning", f"Baixa adesão à musculação: apenas {adesao_treino}% dos treinos cumpridos."))
 
     if corridas_prescritas > 0:
         if adesao_corrida >= 80:
-            mensagens.append(("success", f"Excelente adesão à corrida: {adesao_corrida:.0f}% das metas cumpridas."))
+            mensagens.append(("success", f"Excelente adesão à corrida: {adesao_corrida}% das metas cumpridas."))
         elif adesao_corrida >= 50:
-            mensagens.append(("info", f"Adesão moderada à corrida: {adesao_corrida:.0f}% das metas cumpridas."))
+            mensagens.append(("info", f"Adesão moderada à corrida: {adesao_corrida}% das metas cumpridas."))
         else:
-            mensagens.append(("warning", f"Baixa adesão à corrida: apenas {adesao_corrida:.0f}% das metas cumpridas."))
+            mensagens.append(("warning", f"Baixa adesão à corrida: apenas {adesao_corrida}% das metas cumpridas."))
 
     if not mensagens:
         st.info("Ainda não há dados suficientes para gerar interpretações. Registre mais dias no Diário.")
