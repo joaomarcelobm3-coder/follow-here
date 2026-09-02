@@ -3,6 +3,7 @@ pandas
 numpy
 plotly
 scikit-learn
-requests
 icalendar
+python-dateutil
+requests
 gpxpy
