@@ -232,14 +232,37 @@ COLUNAS_DIETA = [
 
 TIPOS_REFEICAO = ["Café da manhã", "Almoço", "Lanche", "Jantar"]
 
+# Colunas de texto livre de cada tabela: precisam ser forçadas para dtype
+# 'object' (string), pois quando ficam totalmente vazias o Pandas as infere
+# como float64 — e gravar uma string nelas depois causa TypeError.
+COLUNAS_TEXTO_MUSCULACAO = ["exercicio"]
+COLUNAS_TEXTO_CORRIDA = ["comentarios"]
+COLUNAS_TEXTO_DIETA = ["refeicao", "prescrito", "alimento_consumido"]
 
-def carregar_csv(caminho, colunas):
+
+def garantir_dtype_texto(df, colunas_texto):
+    """
+    Garante que as colunas de texto livre informadas estejam sempre com
+    dtype 'object'. Sem isso, uma coluna totalmente vazia (NaN) é inferida
+    pelo Pandas como float64, e uma tentativa posterior de gravar texto nela
+    (via .loc) gera TypeError: Invalid value for dtype 'float64'.
+    """
+    for col in colunas_texto:
+        if col in df.columns and df[col].dtype != object:
+            df[col] = df[col].astype(object)
+    return df
+
+
+def carregar_csv(caminho, colunas, colunas_texto=None):
     """
     Carrega um DataFrame a partir de um arquivo CSV, se ele existir no disco.
     Caso contrário, retorna um DataFrame vazio com as colunas corretas.
     A coluna 'data' é convertida para datetime.date, garantindo compatibilidade
-    com os seletores de data do Streamlit (st.date_input).
+    com os seletores de data do Streamlit (st.date_input). As colunas de texto
+    livre são forçadas para dtype 'object' para evitar erros de coerção do
+    Pandas ao gravar strings posteriormente.
     """
+    colunas_texto = colunas_texto or []
     if os.path.exists(caminho):
         df = pd.read_csv(caminho)
         if "data" in df.columns and not df.empty:
@@ -247,8 +270,11 @@ def carregar_csv(caminho, colunas):
         for col in colunas:
             if col not in df.columns:
                 df[col] = np.nan
-        return df[colunas]
-    return pd.DataFrame(columns=colunas)
+        df = df[colunas]
+    else:
+        df = pd.DataFrame(columns=colunas)
+
+    return garantir_dtype_texto(df, colunas_texto)
 
 
 def salvar_dados_disco():
@@ -274,13 +300,19 @@ def inicializar_estado():
     existirem), permitindo que o histórico persista entre reinícios do app.
     """
     if "musculacao" not in st.session_state:
-        st.session_state["musculacao"] = carregar_csv(ARQUIVO_MUSCULACAO, COLUNAS_MUSCULACAO)
+        st.session_state["musculacao"] = carregar_csv(
+            ARQUIVO_MUSCULACAO, COLUNAS_MUSCULACAO, COLUNAS_TEXTO_MUSCULACAO
+        )
 
     if "corrida" not in st.session_state:
-        st.session_state["corrida"] = carregar_csv(ARQUIVO_CORRIDA, COLUNAS_CORRIDA)
+        st.session_state["corrida"] = carregar_csv(
+            ARQUIVO_CORRIDA, COLUNAS_CORRIDA, COLUNAS_TEXTO_CORRIDA
+        )
 
     if "dieta" not in st.session_state:
-        st.session_state["dieta"] = carregar_csv(ARQUIVO_DIETA, COLUNAS_DIETA)
+        st.session_state["dieta"] = carregar_csv(
+            ARQUIVO_DIETA, COLUNAS_DIETA, COLUNAS_TEXTO_DIETA
+        )
 
 
 inicializar_estado()
@@ -379,6 +411,7 @@ def salvar_realizado_corrida(data_ref, distancia, tempo, comentarios=""):
     pace = tempo / distancia if distancia > 0 else np.nan
     comentarios = comentarios.strip() if isinstance(comentarios, str) else comentarios
     df = st.session_state["corrida"]
+    df = garantir_dtype_texto(df, COLUNAS_TEXTO_CORRIDA)
     filtro = df["data"] == data_ref
 
     if filtro.any():
@@ -408,6 +441,7 @@ def salvar_lote_prescricao_dieta(data_ref, tabela_editada):
     prescrição (alimentos + calorias) de todas as refeições de uma vez.
     """
     df = st.session_state["dieta"]
+    df = garantir_dtype_texto(df, COLUNAS_TEXTO_DIETA)
 
     for _, linha in tabela_editada.iterrows():
         refeicao = str(linha["Refeição"]).strip()
@@ -434,6 +468,7 @@ def salvar_lote_realizado_dieta(data_ref, tabela_editada):
     consumo real (alimentos, quantidade, calorias) de todas de uma vez.
     """
     df = st.session_state["dieta"]
+    df = garantir_dtype_texto(df, COLUNAS_TEXTO_DIETA)
 
     for _, linha in tabela_editada.iterrows():
         refeicao = str(linha["Refeição"]).strip()
