@@ -11,6 +11,10 @@ resultados.
 Os dados vivem em st.session_state durante a execução, mas também são
 persistidos automaticamente em disco (arquivos CSV locais), de forma que
 o histórico não se perca ao reiniciar a aplicação ou fechar o navegador.
+
+Cadastro em lote: musculação e dieta usam st.data_editor, permitindo
+preencher vários exercícios ou refeições de uma só vez, com um único
+clique para salvar.
 """
 
 import os
@@ -29,17 +33,183 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 # ---------------------------------------------------------------------------
 st.set_page_config(
     page_title="Follow Here",
-    page_icon="🎯",
+    page_icon=":material/target:",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
 
 # ---------------------------------------------------------------------------
+# IDENTIDADE VISUAL - CSS CUSTOMIZADO (DARK MODE ELEGANTE)
+# ---------------------------------------------------------------------------
+CSS_APP = """
+<style>
+    :root {
+        --bg-primary: #0E1117;
+        --bg-card: #161B22;
+        --bg-card-hover: #1C2128;
+        --border-subtle: #2A2F3A;
+        --accent-primary: #39FF88;
+        --accent-secondary: #3E8BFF;
+        --text-primary: #F2F4F8;
+        --text-muted: #8B93A1;
+        --danger: #FF5C7A;
+        --warning: #FFB454;
+    }
+
+    html, body, [class*="css"]  {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
+    }
+
+    /* Cabeçalho principal */
+    .fh-hero {
+        padding: 1.4rem 1.6rem;
+        border-radius: 18px;
+        background: linear-gradient(135deg, rgba(57,255,136,0.10), rgba(62,139,255,0.08));
+        border: 1px solid var(--border-subtle);
+        margin-bottom: 1.4rem;
+    }
+    .fh-hero h1 {
+        font-size: 2rem;
+        font-weight: 800;
+        letter-spacing: -0.03em;
+        margin: 0 0 0.2rem 0;
+        background: linear-gradient(90deg, var(--accent-primary), var(--accent-secondary));
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+    }
+    .fh-hero p {
+        color: var(--text-muted);
+        font-size: 0.98rem;
+        margin: 0;
+    }
+
+    /* Cartões de conteúdo */
+    .fh-card {
+        background: var(--bg-card);
+        border: 1px solid var(--border-subtle);
+        border-radius: 16px;
+        padding: 1.1rem 1.3rem;
+        margin-bottom: 0.9rem;
+    }
+    .fh-card h4 {
+        margin: 0 0 0.4rem 0;
+        font-size: 1.02rem;
+        font-weight: 700;
+        color: var(--text-primary);
+    }
+    .fh-card p {
+        color: var(--text-muted);
+        font-size: 0.92rem;
+        margin: 0;
+        line-height: 1.5;
+    }
+
+    /* Rótulo de seção */
+    .fh-section-title {
+        font-size: 1.05rem;
+        font-weight: 700;
+        color: var(--text-primary);
+        margin: 1.6rem 0 0.6rem 0;
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+    }
+    .fh-section-title .fh-tag {
+        font-size: 0.65rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        padding: 0.15rem 0.5rem;
+        border-radius: 999px;
+        background: rgba(57,255,136,0.12);
+        color: var(--accent-primary);
+        border: 1px solid rgba(57,255,136,0.35);
+    }
+    .fh-section-sub {
+        color: var(--text-muted);
+        font-size: 0.86rem;
+        margin: -0.3rem 0 0.8rem 0;
+    }
+
+    /* Cartões de KPI */
+    .fh-kpi {
+        background: var(--bg-card);
+        border: 1px solid var(--border-subtle);
+        border-radius: 16px;
+        padding: 1rem 1.1rem;
+        text-align: left;
+    }
+    .fh-kpi .fh-kpi-label {
+        font-size: 0.78rem;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: var(--text-muted);
+        font-weight: 600;
+    }
+    .fh-kpi .fh-kpi-value {
+        font-size: 1.85rem;
+        font-weight: 800;
+        color: var(--text-primary);
+        margin-top: 0.15rem;
+    }
+    .fh-kpi .fh-kpi-value.accent { color: var(--accent-primary); }
+    .fh-kpi .fh-kpi-value.blue { color: var(--accent-secondary); }
+    .fh-kpi .fh-kpi-value.warn { color: var(--warning); }
+
+    /* Pílulas de status */
+    .fh-pill {
+        display: inline-block;
+        padding: 0.2rem 0.65rem;
+        border-radius: 999px;
+        font-size: 0.75rem;
+        font-weight: 700;
+    }
+    .fh-pill.ok { background: rgba(57,255,136,0.14); color: var(--accent-primary); }
+    .fh-pill.mid { background: rgba(62,139,255,0.14); color: var(--accent-secondary); }
+    .fh-pill.low { background: rgba(255,92,122,0.14); color: var(--danger); }
+
+    div[data-testid="stMetric"] {
+        background: var(--bg-card);
+        border: 1px solid var(--border-subtle);
+        border-radius: 14px;
+        padding: 0.85rem 1rem;
+    }
+
+    button[kind="primary"], button[kind="secondary"] {
+        border-radius: 10px !important;
+    }
+
+    hr { border-color: var(--border-subtle) !important; }
+</style>
+"""
+st.markdown(CSS_APP, unsafe_allow_html=True)
+
+
+def cartao_kpi(label, valor, tom="accent"):
+    """Renderiza um cartão de KPI estilizado em HTML/CSS customizado."""
+    st.markdown(
+        f"""
+        <div class="fh-kpi">
+            <div class="fh-kpi-label">{label}</div>
+            <div class="fh-kpi-value {tom}">{valor}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def titulo_secao(texto, tag=None, subtitulo=None):
+    """Renderiza um título de seção estilizado, com tag opcional e subtítulo curto."""
+    tag_html = f'<span class="fh-tag">{tag}</span>' if tag else ""
+    st.markdown(f'<div class="fh-section-title">{texto} {tag_html}</div>', unsafe_allow_html=True)
+    if subtitulo:
+        st.markdown(f'<div class="fh-section-sub">{subtitulo}</div>', unsafe_allow_html=True)
+
+
+# ---------------------------------------------------------------------------
 # PERSISTÊNCIA EM DISCO (ARQUIVOS CSV LOCAIS)
 # ---------------------------------------------------------------------------
-# Caminhos dos arquivos CSV usados para persistir cada tabela. Ficam na mesma
-# pasta do script, permitindo que os dados sobrevivam a reinícios do app.
 DIRETORIO_BASE = os.path.dirname(os.path.abspath(__file__))
 ARQUIVO_MUSCULACAO = os.path.join(DIRETORIO_BASE, "dados_musculacao.csv")
 ARQUIVO_CORRIDA = os.path.join(DIRETORIO_BASE, "dados_corrida.csv")
@@ -59,6 +229,8 @@ COLUNAS_DIETA = [
     "qtd_g", "calorias_prescritas", "calorias_consumidas",
 ]
 
+TIPOS_REFEICAO = ["Café da manhã", "Almoço", "Lanche", "Jantar"]
+
 
 def carregar_csv(caminho, colunas):
     """
@@ -71,7 +243,10 @@ def carregar_csv(caminho, colunas):
         df = pd.read_csv(caminho)
         if "data" in df.columns and not df.empty:
             df["data"] = pd.to_datetime(df["data"]).dt.date
-        return df
+        for col in colunas:
+            if col not in df.columns:
+                df[col] = np.nan
+        return df[colunas]
     return pd.DataFrame(columns=colunas)
 
 
@@ -97,19 +272,12 @@ def inicializar_estado():
     os dados são carregados automaticamente dos arquivos CSV em disco (se
     existirem), permitindo que o histórico persista entre reinícios do app.
     """
-
-    # Histórico de musculação: cada linha representa um exercício em uma
-    # data específica, podendo conter dados prescritos, realizados, ou ambos.
     if "musculacao" not in st.session_state:
         st.session_state["musculacao"] = carregar_csv(ARQUIVO_MUSCULACAO, COLUNAS_MUSCULACAO)
 
-    # Histórico de corrida: uma linha por data, com meta prescrita e o que
-    # foi de fato realizado.
     if "corrida" not in st.session_state:
         st.session_state["corrida"] = carregar_csv(ARQUIVO_CORRIDA, COLUNAS_CORRIDA)
 
-    # Histórico de dieta: uma linha por refeição/data, podendo ter apenas a
-    # prescrição, apenas o consumo real, ou ambos.
     if "dieta" not in st.session_state:
         st.session_state["dieta"] = carregar_csv(ARQUIVO_DIETA, COLUNAS_DIETA)
 
@@ -118,43 +286,64 @@ inicializar_estado()
 
 
 # ---------------------------------------------------------------------------
-# FUNÇÕES AUXILIARES - MUSCULAÇÃO
+# FUNÇÕES AUXILIARES - MUSCULAÇÃO (CADASTRO EM LOTE)
 # ---------------------------------------------------------------------------
-def salvar_prescricao_musculacao(data_ref, exercicio, series, reps, carga):
-    """Cria ou atualiza a prescrição de um exercício em uma data."""
+def salvar_lote_prescricao_musculacao(data_ref, tabela_editada):
+    """
+    Recebe o DataFrame preenchido no data_editor (um exercício por linha) e
+    grava/atualiza a prescrição de todos os exercícios da data de uma vez.
+    Linhas sem nome de exercício são ignoradas.
+    """
     df = st.session_state["musculacao"]
-    filtro = (df["data"] == data_ref) & (df["exercicio"] == exercicio)
+    tabela_editada = tabela_editada[tabela_editada["Exercício"].astype(str).str.strip() != ""]
 
-    if filtro.any():
-        df.loc[filtro, ["series_prescritas", "reps_prescritas", "carga_prescrita"]] = [series, reps, carga]
-    else:
-        nova_linha = {
-            "data": data_ref, "exercicio": exercicio,
-            "series_prescritas": series, "reps_prescritas": reps, "carga_prescrita": carga,
-            "series_realizadas": np.nan, "reps_realizadas": np.nan, "carga_realizada": np.nan,
-        }
-        st.session_state["musculacao"] = pd.concat([df, pd.DataFrame([nova_linha])], ignore_index=True)
+    for _, linha in tabela_editada.iterrows():
+        exercicio = str(linha["Exercício"]).strip()
+        filtro = (df["data"] == data_ref) & (df["exercicio"] == exercicio)
+        valores = [linha["Séries"], linha["Repetições"], linha["Carga (kg)"]]
 
+        if filtro.any():
+            df.loc[filtro, ["series_prescritas", "reps_prescritas", "carga_prescrita"]] = valores
+        else:
+            nova_linha = {
+                "data": data_ref, "exercicio": exercicio,
+                "series_prescritas": linha["Séries"], "reps_prescritas": linha["Repetições"],
+                "carga_prescrita": linha["Carga (kg)"],
+                "series_realizadas": np.nan, "reps_realizadas": np.nan, "carga_realizada": np.nan,
+            }
+            df = pd.concat([df, pd.DataFrame([nova_linha])], ignore_index=True)
+
+    st.session_state["musculacao"] = df
     salvar_dados_disco()
 
 
-def salvar_realizado_musculacao(data_ref, exercicio, series, reps, carga):
-    """Registra a execução real de um exercício, casando com a prescrição se existir."""
+def salvar_lote_realizado_musculacao(data_ref, tabela_editada):
+    """
+    Recebe o DataFrame preenchido no data_editor com a execução real de
+    vários exercícios e grava/atualiza todos de uma vez, casando com a
+    prescrição existente sempre que possível.
+    """
     df = st.session_state["musculacao"]
-    filtro = (df["data"] == data_ref) & (df["exercicio"] == exercicio)
+    tabela_editada = tabela_editada[tabela_editada["Exercício"].astype(str).str.strip() != ""]
 
-    if filtro.any():
-        # Atualiza a primeira ocorrência sem execução ainda registrada, senão a primeira encontrada
-        idx = df[filtro].index[0]
-        df.loc[idx, ["series_realizadas", "reps_realizadas", "carga_realizada"]] = [series, reps, carga]
-    else:
-        nova_linha = {
-            "data": data_ref, "exercicio": exercicio,
-            "series_prescritas": np.nan, "reps_prescritas": np.nan, "carga_prescrita": np.nan,
-            "series_realizadas": series, "reps_realizadas": reps, "carga_realizada": carga,
-        }
-        st.session_state["musculacao"] = pd.concat([df, pd.DataFrame([nova_linha])], ignore_index=True)
+    for _, linha in tabela_editada.iterrows():
+        exercicio = str(linha["Exercício"]).strip()
+        filtro = (df["data"] == data_ref) & (df["exercicio"] == exercicio)
+        valores = [linha["Séries"], linha["Repetições"], linha["Carga (kg)"]]
 
+        if filtro.any():
+            idx = df[filtro].index[0]
+            df.loc[idx, ["series_realizadas", "reps_realizadas", "carga_realizada"]] = valores
+        else:
+            nova_linha = {
+                "data": data_ref, "exercicio": exercicio,
+                "series_prescritas": np.nan, "reps_prescritas": np.nan, "carga_prescrita": np.nan,
+                "series_realizadas": linha["Séries"], "reps_realizadas": linha["Repetições"],
+                "carga_realizada": linha["Carga (kg)"],
+            }
+            df = pd.concat([df, pd.DataFrame([nova_linha])], ignore_index=True)
+
+    st.session_state["musculacao"] = df
     salvar_dados_disco()
 
 
@@ -201,43 +390,60 @@ def salvar_realizado_corrida(data_ref, distancia, tempo):
 
 
 # ---------------------------------------------------------------------------
-# FUNÇÕES AUXILIARES - DIETA
+# FUNÇÕES AUXILIARES - DIETA (CADASTRO EM LOTE)
 # ---------------------------------------------------------------------------
-def salvar_prescricao_dieta(data_ref, refeicao, prescrito_texto, calorias_prescritas):
-    """Cria ou atualiza a prescrição de uma refeição em uma data."""
+def salvar_lote_prescricao_dieta(data_ref, tabela_editada):
+    """
+    Recebe o DataFrame do data_editor com uma linha por refeição e grava a
+    prescrição (alimentos + calorias) de todas as refeições de uma vez.
+    """
     df = st.session_state["dieta"]
-    filtro = (df["data"] == data_ref) & (df["refeicao"] == refeicao) & (df["alimento_consumido"].isna())
 
-    if filtro.any():
-        idx = df[filtro].index[0]
-        df.loc[idx, ["prescrito", "calorias_prescritas"]] = [prescrito_texto, calorias_prescritas]
-    else:
-        nova_linha = {
-            "data": data_ref, "refeicao": refeicao,
-            "prescrito": prescrito_texto, "alimento_consumido": np.nan,
-            "qtd_g": np.nan, "calorias_prescritas": calorias_prescritas, "calorias_consumidas": np.nan,
-        }
-        st.session_state["dieta"] = pd.concat([df, pd.DataFrame([nova_linha])], ignore_index=True)
+    for _, linha in tabela_editada.iterrows():
+        refeicao = str(linha["Refeição"]).strip()
+        filtro = (df["data"] == data_ref) & (df["refeicao"] == refeicao) & (df["alimento_consumido"].isna())
 
+        if filtro.any():
+            idx = df[filtro].index[0]
+            df.loc[idx, ["prescrito", "calorias_prescritas"]] = [linha["Alimentos planejados"], linha["Calorias (kcal)"]]
+        else:
+            nova_linha = {
+                "data": data_ref, "refeicao": refeicao,
+                "prescrito": linha["Alimentos planejados"], "alimento_consumido": np.nan,
+                "qtd_g": np.nan, "calorias_prescritas": linha["Calorias (kcal)"], "calorias_consumidas": np.nan,
+            }
+            df = pd.concat([df, pd.DataFrame([nova_linha])], ignore_index=True)
+
+    st.session_state["dieta"] = df
     salvar_dados_disco()
 
 
-def salvar_realizado_dieta(data_ref, refeicao, alimento, qtd, calorias):
-    """Registra o consumo real de uma refeição, reaproveitando a prescrição pendente se existir."""
+def salvar_lote_realizado_dieta(data_ref, tabela_editada):
+    """
+    Recebe o DataFrame do data_editor com uma linha por refeição e grava o
+    consumo real (alimentos, quantidade, calorias) de todas de uma vez.
+    """
     df = st.session_state["dieta"]
-    filtro = (df["data"] == data_ref) & (df["refeicao"] == refeicao) & (df["alimento_consumido"].isna())
 
-    if filtro.any():
-        idx = df[filtro].index[0]
-        df.loc[idx, ["alimento_consumido", "qtd_g", "calorias_consumidas"]] = [alimento, qtd, calorias]
-    else:
-        nova_linha = {
-            "data": data_ref, "refeicao": refeicao,
-            "prescrito": np.nan, "alimento_consumido": alimento,
-            "qtd_g": qtd, "calorias_prescritas": np.nan, "calorias_consumidas": calorias,
-        }
-        st.session_state["dieta"] = pd.concat([df, pd.DataFrame([nova_linha])], ignore_index=True)
+    for _, linha in tabela_editada.iterrows():
+        refeicao = str(linha["Refeição"]).strip()
+        filtro = (df["data"] == data_ref) & (df["refeicao"] == refeicao) & (df["alimento_consumido"].isna())
 
+        if filtro.any():
+            idx = df[filtro].index[0]
+            df.loc[idx, ["alimento_consumido", "qtd_g", "calorias_consumidas"]] = [
+                linha["Alimentos consumidos"], linha["Qtd (g)"], linha["Calorias (kcal)"],
+            ]
+        else:
+            nova_linha = {
+                "data": data_ref, "refeicao": refeicao,
+                "prescrito": np.nan, "alimento_consumido": linha["Alimentos consumidos"],
+                "qtd_g": linha["Qtd (g)"], "calorias_prescritas": np.nan,
+                "calorias_consumidas": linha["Calorias (kcal)"],
+            }
+            df = pd.concat([df, pd.DataFrame([nova_linha])], ignore_index=True)
+
+    st.session_state["dieta"] = df
     salvar_dados_disco()
 
 
@@ -287,17 +493,32 @@ def prever_tendencia(datas, valores, dias_futuros=30):
 # ---------------------------------------------------------------------------
 # BARRA LATERAL - NAVEGAÇÃO
 # ---------------------------------------------------------------------------
-st.sidebar.title("🎯 Follow Here")
-st.sidebar.caption("Diário de treino, corrida e dieta com evolução inteligente")
+st.sidebar.markdown(
+    """
+    <div style="padding:0.4rem 0 1rem 0;">
+        <div style="font-size:1.5rem; font-weight:800; letter-spacing:-0.02em;
+                    background:linear-gradient(90deg,#39FF88,#3E8BFF);
+                    -webkit-background-clip:text; -webkit-text-fill-color:transparent;">
+            Follow Here
+        </div>
+        <div style="font-size:0.8rem; color:#8B93A1;">
+            Treino, corrida e dieta — prescrito vs. realizado
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 pagina = st.sidebar.radio(
     "Navegação",
-    ["🏠 Início", "📔 Diário", "📈 Evolução"],
+    ["Início", "Diário", "Evolução"],
     label_visibility="collapsed",
 )
 st.sidebar.markdown("---")
-st.sidebar.info("Seus registros são salvos automaticamente em arquivos CSV locais "
-                 "(dados_musculacao.csv, dados_corrida.csv, dados_dieta.csv), "
-                 "permanecendo disponíveis mesmo após reiniciar o aplicativo.")
+st.sidebar.caption(
+    "Seus registros são salvos automaticamente em arquivos CSV locais "
+    "(dados_musculacao.csv, dados_corrida.csv, dados_dieta.csv) e "
+    "permanecem disponíveis mesmo após reiniciar o aplicativo."
+)
 
 
 # ===========================================================================
@@ -305,34 +526,42 @@ st.sidebar.info("Seus registros são salvos automaticamente em arquivos CSV loca
 # ===========================================================================
 def pagina_inicio():
     """Landing page com apresentação do app e métricas rápidas."""
-    st.title("🎯 Follow Here")
-    st.subheader("Acompanhe seu treino, sua corrida e sua dieta — tudo em um só lugar")
-
-    st.markdown("""
-    O **Follow Here** foi criado para ajudar você a comparar, todos os dias,
-    o que foi **planejado** com o que foi **realmente executado** — seja na
-    academia, na pista de corrida ou no prato. Assim, fica fácil enxergar
-    onde você está evoluindo e onde precisa ajustar a rota.
-    """)
+    st.markdown(
+        """
+        <div class="fh-hero">
+            <h1>Follow Here</h1>
+            <p>Compare, todos os dias, o que foi planejado com o que foi realmente executado —
+            na academia, na pista e no prato.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     col1, col2 = st.columns(2)
     with col1:
-        st.markdown("#### 📔 Diário de Registro")
-        st.write(
-            "Selecione uma data e registre, em três sub-abas dedicadas, sua "
-            "execução real de musculação, corrida e dieta, comparando lado a "
-            "lado com o que foi prescrito para o dia."
+        st.markdown(
+            """
+            <div class="fh-card">
+                <h4>Diário de Registro</h4>
+                <p>Escolha uma data e registre, em lote, sua execução real de musculação,
+                corrida e dieta, comparando lado a lado com o que foi prescrito.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
     with col2:
-        st.markdown("#### 📈 Acompanhamento de Evolução")
-        st.write(
-            "Veja seu histórico completo, indicadores de adesão, gráficos "
-            "interativos de progresso e uma previsão de tendência para os "
-            "próximos 30 dias, com interpretação automática dos resultados."
+        st.markdown(
+            """
+            <div class="fh-card">
+                <h4>Painel de Evolução</h4>
+                <p>Histórico completo, indicadores de adesão, gráficos interativos e
+                previsão de tendência para os próximos 30 dias.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
 
-    st.markdown("---")
-    st.markdown("### 📊 Resumo geral")
+    titulo_secao("Resumo geral", subtitulo="Um retrato rápido de tudo o que você já registrou.")
 
     df_musc = st.session_state["musculacao"]
     df_corrida = st.session_state["corrida"]
@@ -343,94 +572,138 @@ def pagina_inicio():
     total_km = df_corrida["distancia_real_km"].dropna().sum()
 
     c1, c2, c3 = st.columns(3)
-    c1.metric("🏋️ Treinos registrados", int(total_treinos))
-    c2.metric("🥗 Refeições registradas", int(total_refeicoes))
-    c3.metric("🏃 Km rodados (total)", f"{total_km:.1f} km")
+    with c1:
+        cartao_kpi("Treinos registrados", int(total_treinos), "accent")
+    with c2:
+        cartao_kpi("Refeições registradas", int(total_refeicoes), "blue")
+    with c3:
+        cartao_kpi("Km rodados (total)", f"{total_km:.1f} km", "warn")
 
     if total_treinos == 0 and total_refeicoes == 0 and total_km == 0:
-        st.info("Você ainda não tem registros. Vá até a aba **Diário** para começar!")
+        st.info("Você ainda não tem registros. Acesse o **Diário** para começar.")
 
 
 # ===========================================================================
 # PÁGINA 2 - DIÁRIO
 # ===========================================================================
 def pagina_diario():
-    """Página de registro diário, com comparativo prescrito x realizado."""
-    st.title("📔 Diário de Registro")
+    """Página de registro diário, com cadastro em lote e comparativo prescrito x realizado."""
+    st.markdown(
+        """
+        <div class="fh-hero">
+            <h1>Diário de Registro</h1>
+            <p>Preencha tudo de uma vez em tabelas editáveis e salve com um único clique.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    data_selecionada = st.date_input("Selecione a data do registro", value=date.today())
+    data_selecionada = st.date_input("Data do registro", value=date.today())
 
-    aba_musc, aba_corrida, aba_dieta = st.tabs(["🏋️ Musculação", "🏃 Corrida", "🥗 Dieta"])
+    aba_musc, aba_corrida, aba_dieta = st.tabs(["Musculação", "Corrida", "Dieta"])
 
     # ------------------------------------------------------------------
     # SUB-ABA MUSCULAÇÃO
     # ------------------------------------------------------------------
     with aba_musc:
-        st.markdown("#### Prescrição do dia")
+        titulo_secao("Prescrição do dia", tag="Planejado")
         df_musc = st.session_state["musculacao"]
         prescritos_dia = df_musc[
             (df_musc["data"] == data_selecionada) & (df_musc["carga_prescrita"].notna())
         ]
 
         if prescritos_dia.empty:
-            st.warning("Nenhum treino prescrito para esta data ainda.")
+            st.info("Nenhum treino prescrito para esta data ainda.")
         else:
             st.dataframe(
                 prescritos_dia[["exercicio", "series_prescritas", "reps_prescritas", "carga_prescrita"]]
                 .rename(columns={
                     "exercicio": "Exercício", "series_prescritas": "Séries",
-                    "reps_prescritas": "Repetições", "carga_prescrita": "Carga (kg)",
+                    "reps_prescritas": "Reps", "carga_prescrita": "Carga (kg)",
                 }),
                 use_container_width=True, hide_index=True,
             )
 
-        with st.expander("➕ Cadastrar / editar prescrição de exercício"):
-            with st.form("form_prescricao_musc", clear_on_submit=True):
-                col1, col2, col3 = st.columns(3)
-                ex_nome = col1.text_input("Nome do exercício")
-                ex_series = col2.number_input("Séries prescritas", min_value=0, step=1, value=0)
-                ex_reps = col3.number_input("Repetições prescritas", min_value=0, step=1, value=0)
-                ex_carga = st.number_input("Carga prescrita (kg)", min_value=0.0, step=0.5, value=0.0)
-                enviado = st.form_submit_button("Salvar prescrição")
-                if enviado:
-                    if ex_nome.strip() == "":
-                        st.error("Informe o nome do exercício.")
-                    else:
-                        salvar_prescricao_musculacao(data_selecionada, ex_nome.strip(), ex_series, ex_reps, ex_carga)
-                        st.success(f"Prescrição de '{ex_nome}' salva para {data_selecionada}.")
-                        st.rerun()
-
-        st.markdown("---")
-        st.markdown("#### Registrar execução real")
-        with st.form("form_realizado_musc", clear_on_submit=True):
-            col1, col2, col3 = st.columns(3)
-            ex_nome_r = col1.text_input("Nome do exercício realizado")
-            ex_series_r = col2.number_input("Séries realizadas", min_value=0, step=1, value=0, key="sr")
-            ex_reps_r = col3.number_input("Repetições realizadas", min_value=0, step=1, value=0, key="rr")
-            ex_carga_r = st.number_input("Carga realizada (kg)", min_value=0.0, step=0.5, value=0.0, key="cr")
-            enviado_r = st.form_submit_button("Registrar execução")
-            if enviado_r:
-                if ex_nome_r.strip() == "":
-                    st.error("Informe o nome do exercício.")
+        with st.expander("Cadastrar treino prescrito em lote"):
+            st.caption("Defina quantos exercícios compõem o treino e preencha tudo de uma vez.")
+            qtd_ex_p = st.number_input(
+                "Quantidade de exercícios", min_value=1, max_value=30, value=5, step=1, key="qtd_ex_prescrito",
+            )
+            modelo_prescrito = pd.DataFrame({
+                "Exercício": [""] * qtd_ex_p,
+                "Séries": [0] * qtd_ex_p,
+                "Repetições": [0] * qtd_ex_p,
+                "Carga (kg)": [0.0] * qtd_ex_p,
+            })
+            tabela_prescrito = st.data_editor(
+                modelo_prescrito,
+                use_container_width=True,
+                hide_index=True,
+                num_rows="dynamic",
+                key="editor_musc_prescrito",
+                column_config={
+                    "Séries": st.column_config.NumberColumn(min_value=0, step=1),
+                    "Repetições": st.column_config.NumberColumn(min_value=0, step=1),
+                    "Carga (kg)": st.column_config.NumberColumn(min_value=0.0, step=0.5, format="%.1f"),
+                },
+            )
+            if st.button("Salvar treino prescrito", use_container_width=True, key="btn_salvar_prescrito_musc"):
+                validos = tabela_prescrito[tabela_prescrito["Exercício"].astype(str).str.strip() != ""]
+                if validos.empty:
+                    st.error("Preencha ao menos o nome de um exercício.")
                 else:
-                    salvar_realizado_musculacao(data_selecionada, ex_nome_r.strip(), ex_series_r, ex_reps_r, ex_carga_r)
-                    st.success(f"Execução de '{ex_nome_r}' registrada.")
+                    salvar_lote_prescricao_musculacao(data_selecionada, tabela_prescrito)
+                    st.success(f"{len(validos)} exercício(s) prescrito(s) salvos para {data_selecionada}.")
                     st.rerun()
 
         st.markdown("---")
-        st.markdown("#### Comparativo: Prescrito vs. Realizado")
+        titulo_secao("Execução real", tag="Realizado")
+
+        with st.expander("Registrar execução em lote", expanded=True):
+            st.caption("Registre séries, repetições e carga de todos os exercícios treinados hoje.")
+            qtd_ex_r = st.number_input(
+                "Quantidade de exercícios", min_value=1, max_value=30, value=5, step=1, key="qtd_ex_realizado",
+            )
+            modelo_realizado = pd.DataFrame({
+                "Exercício": [""] * qtd_ex_r,
+                "Séries": [0] * qtd_ex_r,
+                "Repetições": [0] * qtd_ex_r,
+                "Carga (kg)": [0.0] * qtd_ex_r,
+            })
+            tabela_realizado = st.data_editor(
+                modelo_realizado,
+                use_container_width=True,
+                hide_index=True,
+                num_rows="dynamic",
+                key="editor_musc_realizado",
+                column_config={
+                    "Séries": st.column_config.NumberColumn(min_value=0, step=1),
+                    "Repetições": st.column_config.NumberColumn(min_value=0, step=1),
+                    "Carga (kg)": st.column_config.NumberColumn(min_value=0.0, step=0.5, format="%.1f"),
+                },
+            )
+            if st.button("Salvar treino realizado", use_container_width=True, key="btn_salvar_realizado_musc"):
+                validos = tabela_realizado[tabela_realizado["Exercício"].astype(str).str.strip() != ""]
+                if validos.empty:
+                    st.error("Preencha ao menos o nome de um exercício.")
+                else:
+                    salvar_lote_realizado_musculacao(data_selecionada, tabela_realizado)
+                    st.success(f"{len(validos)} exercício(s) registrados para {data_selecionada}.")
+                    st.rerun()
+
+        st.markdown("---")
+        titulo_secao("Comparativo do dia", subtitulo="Prescrito ao lado do realizado, exercício por exercício.")
         registros_dia = df_musc[df_musc["data"] == data_selecionada]
         if registros_dia.empty:
             st.info("Nenhum dado de musculação para esta data.")
         else:
             tabela = registros_dia[[
                 "exercicio", "series_prescritas", "series_realizadas",
-                "reps_prescritas", "reps_realizadas", "carga_prescrita", "carga_realizada",
+                "carga_prescrita", "carga_realizada",
             ]].rename(columns={
                 "exercicio": "Exercício",
-                "series_prescritas": "Séries (Presc.)", "series_realizadas": "Séries (Real.)",
-                "reps_prescritas": "Reps (Presc.)", "reps_realizadas": "Reps (Real.)",
-                "carga_prescrita": "Carga Presc. (kg)", "carga_realizada": "Carga Real. (kg)",
+                "series_prescritas": "Séries Presc.", "series_realizadas": "Séries Real.",
+                "carga_prescrita": "Carga Presc.", "carga_realizada": "Carga Real.",
             })
             st.dataframe(tabela, use_container_width=True, hide_index=True)
 
@@ -438,55 +711,58 @@ def pagina_diario():
     # SUB-ABA CORRIDA
     # ------------------------------------------------------------------
     with aba_corrida:
-        st.markdown("#### Meta prescrita do dia")
+        titulo_secao("Meta do dia", tag="Planejado")
         df_corrida = st.session_state["corrida"]
         meta_dia = df_corrida[df_corrida["data"] == data_selecionada]
 
         if meta_dia.empty or meta_dia["distancia_prescrita_km"].isna().all():
-            st.warning("Nenhuma meta de corrida prescrita para esta data ainda.")
+            st.info("Nenhuma meta de corrida prescrita para esta data ainda.")
         else:
             linha = meta_dia.iloc[0]
             c1, c2 = st.columns(2)
             c1.metric("Distância prescrita", f"{linha['distancia_prescrita_km']:.1f} km")
             c2.metric("Tempo prescrito", f"{linha['tempo_prescrito_min']:.0f} min")
 
-        with st.expander("➕ Cadastrar / editar meta de corrida"):
+        with st.expander("Cadastrar / editar meta de corrida"):
             with st.form("form_prescricao_corrida", clear_on_submit=True):
                 col1, col2 = st.columns(2)
                 dist_p = col1.number_input("Distância prescrita (km)", min_value=0.0, step=0.5, value=0.0)
                 tempo_p = col2.number_input("Tempo prescrito (min)", min_value=0.0, step=1.0, value=0.0)
-                enviado = st.form_submit_button("Salvar meta")
+                enviado = st.form_submit_button("Salvar meta", use_container_width=True)
                 if enviado:
                     salvar_prescricao_corrida(data_selecionada, dist_p, tempo_p)
                     st.success("Meta de corrida salva.")
                     st.rerun()
 
         st.markdown("---")
-        st.markdown("#### Registrar corrida realizada")
+        titulo_secao("Corrida realizada", tag="Realizado")
         with st.form("form_realizado_corrida", clear_on_submit=True):
             col1, col2 = st.columns(2)
             dist_r = col1.number_input("Distância realizada (km)", min_value=0.0, step=0.1, value=0.0, key="dr")
             tempo_r = col2.number_input("Tempo realizado (min)", min_value=0.0, step=1.0, value=0.0, key="tr")
-            enviado_r = st.form_submit_button("Registrar corrida")
+            enviado_r = st.form_submit_button("Registrar corrida", use_container_width=True)
             if enviado_r:
                 if dist_r <= 0:
                     st.error("Informe uma distância maior que zero.")
                 else:
                     pace = salvar_realizado_corrida(data_selecionada, dist_r, tempo_r)
-                    st.success(f"Corrida registrada! Pace calculado: {pace:.2f} min/km")
+                    st.success(f"Corrida registrada. Pace calculado: {pace:.2f} min/km")
                     st.rerun()
 
         st.markdown("---")
-        st.markdown("#### Comparativo: Meta vs. Executado")
+        titulo_secao("Comparativo do dia")
         registro_corrida_dia = df_corrida[df_corrida["data"] == data_selecionada]
         if registro_corrida_dia.empty:
             st.info("Nenhum dado de corrida para esta data.")
         else:
             linha = registro_corrida_dia.iloc[0]
             c1, c2, c3 = st.columns(3)
-            c1.metric("Distância", f"{linha.get('distancia_real_km', np.nan):.2f} km" if pd.notna(linha.get("distancia_real_km")) else "—",
-                       delta=(f"{(linha['distancia_real_km'] - linha['distancia_prescrita_km']):.2f} km"
-                              if pd.notna(linha.get("distancia_real_km")) and pd.notna(linha.get("distancia_prescrita_km")) else None))
+            c1.metric(
+                "Distância",
+                f"{linha.get('distancia_real_km', np.nan):.2f} km" if pd.notna(linha.get("distancia_real_km")) else "—",
+                delta=(f"{(linha['distancia_real_km'] - linha['distancia_prescrita_km']):.2f} km"
+                       if pd.notna(linha.get("distancia_real_km")) and pd.notna(linha.get("distancia_prescrita_km")) else None),
+            )
             c2.metric("Tempo", f"{linha.get('tempo_real_min', np.nan):.0f} min" if pd.notna(linha.get("tempo_real_min")) else "—")
             c3.metric("Pace", f"{linha.get('pace_real', np.nan):.2f} min/km" if pd.notna(linha.get("pace_real")) else "—")
 
@@ -494,60 +770,80 @@ def pagina_diario():
     # SUB-ABA DIETA
     # ------------------------------------------------------------------
     with aba_dieta:
-        tipos_refeicao = ["Café da manhã", "Almoço", "Jantar", "Lanche"]
-
-        st.markdown("#### Dieta prescrita do dia")
+        titulo_secao("Dieta prescrita do dia", tag="Planejado")
         df_dieta = st.session_state["dieta"]
         prescricoes_dia = df_dieta[
             (df_dieta["data"] == data_selecionada) & (df_dieta["prescrito"].notna())
         ]
         if prescricoes_dia.empty:
-            st.warning("Nenhuma refeição prescrita para esta data ainda.")
+            st.info("Nenhuma refeição prescrita para esta data ainda.")
         else:
             st.dataframe(
                 prescricoes_dia[["refeicao", "prescrito", "calorias_prescritas"]]
-                .rename(columns={"refeicao": "Refeição", "prescrito": "Planejado", "calorias_prescritas": "Calorias (kcal)"}),
+                .rename(columns={"refeicao": "Refeição", "prescrito": "Planejado", "calorias_prescritas": "Kcal"}),
                 use_container_width=True, hide_index=True,
             )
 
-        with st.expander("➕ Cadastrar / editar refeição prescrita"):
-            with st.form("form_prescricao_dieta", clear_on_submit=True):
-                refeicao_p = st.selectbox("Refeição", tipos_refeicao, key="ref_p")
-                planejado = st.text_area("Alimentos planejados")
-                cal_p = st.number_input("Calorias prescritas (kcal)", min_value=0.0, step=10.0, value=0.0)
-                enviado = st.form_submit_button("Salvar prescrição de dieta")
-                if enviado:
-                    salvar_prescricao_dieta(data_selecionada, refeicao_p, planejado, cal_p)
-                    st.success(f"Prescrição de '{refeicao_p}' salva.")
-                    st.rerun()
+        with st.expander("Cadastrar dieta prescrita em lote", expanded=True):
+            st.caption("Preencha os alimentos e calorias planejados para cada refeição do dia.")
+            modelo_dieta_p = pd.DataFrame({
+                "Refeição": TIPOS_REFEICAO,
+                "Alimentos planejados": [""] * len(TIPOS_REFEICAO),
+                "Calorias (kcal)": [0.0] * len(TIPOS_REFEICAO),
+            })
+            tabela_dieta_p = st.data_editor(
+                modelo_dieta_p,
+                use_container_width=True,
+                hide_index=True,
+                num_rows="fixed",
+                key="editor_dieta_prescrito",
+                disabled=["Refeição"],
+                column_config={
+                    "Calorias (kcal)": st.column_config.NumberColumn(min_value=0.0, step=10.0, format="%.0f"),
+                },
+            )
+            if st.button("Salvar dieta prescrita", use_container_width=True, key="btn_salvar_prescrito_dieta"):
+                salvar_lote_prescricao_dieta(data_selecionada, tabela_dieta_p)
+                st.success("Dieta prescrita salva para todas as refeições.")
+                st.rerun()
 
         st.markdown("---")
-        st.markdown("#### Registrar consumo real")
-        with st.form("form_realizado_dieta", clear_on_submit=True):
-            refeicao_r = st.selectbox("Tipo de refeição", tipos_refeicao, key="ref_r")
-            alimento_r = st.text_input("Alimentos consumidos")
-            qtd_r = st.number_input("Quantidade (g/unid.)", min_value=0.0, step=10.0, value=0.0)
-            cal_r = st.number_input("Calorias consumidas (kcal)", min_value=0.0, step=10.0, value=0.0, key="calr")
-            enviado_r = st.form_submit_button("Registrar consumo")
-            if enviado_r:
-                if alimento_r.strip() == "":
-                    st.error("Informe os alimentos consumidos.")
-                else:
-                    salvar_realizado_dieta(data_selecionada, refeicao_r, alimento_r.strip(), qtd_r, cal_r)
-                    st.success(f"Consumo de '{refeicao_r}' registrado.")
-                    st.rerun()
+        titulo_secao("Consumo real do dia", tag="Realizado")
+        with st.expander("Registrar consumo em lote", expanded=True):
+            st.caption("Registre o que foi consumido em cada refeição.")
+            modelo_dieta_r = pd.DataFrame({
+                "Refeição": TIPOS_REFEICAO,
+                "Alimentos consumidos": [""] * len(TIPOS_REFEICAO),
+                "Qtd (g)": [0.0] * len(TIPOS_REFEICAO),
+                "Calorias (kcal)": [0.0] * len(TIPOS_REFEICAO),
+            })
+            tabela_dieta_r = st.data_editor(
+                modelo_dieta_r,
+                use_container_width=True,
+                hide_index=True,
+                num_rows="fixed",
+                key="editor_dieta_realizado",
+                disabled=["Refeição"],
+                column_config={
+                    "Qtd (g)": st.column_config.NumberColumn(min_value=0.0, step=10.0, format="%.0f"),
+                    "Calorias (kcal)": st.column_config.NumberColumn(min_value=0.0, step=10.0, format="%.0f"),
+                },
+            )
+            if st.button("Salvar consumo real", use_container_width=True, key="btn_salvar_realizado_dieta"):
+                salvar_lote_realizado_dieta(data_selecionada, tabela_dieta_r)
+                st.success("Consumo real salvo para todas as refeições.")
+                st.rerun()
 
         st.markdown("---")
-        st.markdown("#### Tabela comparativa do dia")
+        titulo_secao("Comparativo do dia")
         registros_dieta_dia = df_dieta[df_dieta["data"] == data_selecionada]
         if registros_dieta_dia.empty:
             st.info("Nenhum dado de dieta para esta data.")
         else:
             tabela = registros_dieta_dia[[
-                "refeicao", "prescrito", "calorias_prescritas", "alimento_consumido", "qtd_g", "calorias_consumidas",
+                "refeicao", "calorias_prescritas", "calorias_consumidas",
             ]].rename(columns={
-                "refeicao": "Refeição", "prescrito": "Planejado", "calorias_prescritas": "Kcal Prescritas",
-                "alimento_consumido": "Consumido", "qtd_g": "Qtd (g)", "calorias_consumidas": "Kcal Consumidas",
+                "refeicao": "Refeição", "calorias_prescritas": "Kcal Presc.", "calorias_consumidas": "Kcal Real.",
             })
             st.dataframe(tabela, use_container_width=True, hide_index=True)
 
@@ -557,7 +853,15 @@ def pagina_diario():
 # ===========================================================================
 def pagina_evolucao():
     """Dashboard com histórico completo, KPIs, gráficos e previsão de tendência."""
-    st.title("📈 Evolução e Análises")
+    st.markdown(
+        """
+        <div class="fh-hero">
+            <h1>Evolução e Análises</h1>
+            <p>Indicadores de adesão, progressão e previsão de tendência para os próximos 30 dias.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     df_musc = st.session_state["musculacao"].copy()
     df_corrida = st.session_state["corrida"].copy()
@@ -566,7 +870,7 @@ def pagina_evolucao():
     # ------------------------------------------------------------------
     # HISTÓRICO COMPLETO EM TABELAS
     # ------------------------------------------------------------------
-    with st.expander("📋 Histórico completo (tabelas)", expanded=False):
+    with st.expander("Histórico completo (tabelas)", expanded=False):
         st.markdown("**Musculação**")
         st.dataframe(df_musc, use_container_width=True, hide_index=True)
         st.markdown("**Corrida**")
@@ -577,7 +881,7 @@ def pagina_evolucao():
     # ------------------------------------------------------------------
     # KPIs DE ADESÃO
     # ------------------------------------------------------------------
-    st.markdown("### 🎯 Indicadores de desempenho (KPIs)")
+    titulo_secao("Indicadores de desempenho", tag="KPIs")
 
     dias_com_treino_prescrito = df_musc.loc[df_musc["carga_prescrita"].notna(), "data"].nunique()
     dias_com_treino_cumprido = df_musc.loc[
@@ -594,16 +898,19 @@ def pagina_evolucao():
     adesao_corrida = (corridas_cumpridas / corridas_prescritas * 100) if corridas_prescritas > 0 else 0
 
     k1, k2, k3 = st.columns(3)
-    k1.metric("Adesão à Musculação", f"{adesao_treino:.0f}%")
-    k2.metric("Adesão à Corrida", f"{adesao_corrida:.0f}%")
-    k3.metric("Adesão à Dieta", f"{adesao_dieta:.0f}%")
+    with k1:
+        cartao_kpi("Adesão à Musculação", f"{adesao_treino:.0f}%", "accent")
+    with k2:
+        cartao_kpi("Adesão à Corrida", f"{adesao_corrida:.0f}%", "blue")
+    with k3:
+        cartao_kpi("Adesão à Dieta", f"{adesao_dieta:.0f}%", "warn")
 
     st.markdown("---")
 
     # ------------------------------------------------------------------
     # GRÁFICO 1: EVOLUÇÃO DE CARGA POR EXERCÍCIO
     # ------------------------------------------------------------------
-    st.markdown("### 🏋️ Evolução de carga (kg) por exercício")
+    titulo_secao("Evolução de carga por exercício", subtitulo="Progressão da carga real ao longo do tempo.")
     dados_carga = df_musc.dropna(subset=["carga_realizada"]).sort_values("data")
     if dados_carga.empty:
         st.info("Ainda não há execuções de musculação registradas.")
@@ -611,13 +918,18 @@ def pagina_evolucao():
         fig_carga = px.line(
             dados_carga, x="data", y="carga_realizada", color="exercicio", markers=True,
             labels={"data": "Data", "carga_realizada": "Carga realizada (kg)", "exercicio": "Exercício"},
+            color_discrete_sequence=["#39FF88", "#3E8BFF", "#FFB454", "#FF5C7A", "#B18CFF", "#4FE0D4"],
+        )
+        fig_carga.update_layout(
+            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+            font_color="#F2F4F8", legend=dict(orientation="h", yanchor="bottom", y=1.02),
         )
         st.plotly_chart(fig_carga, use_container_width=True)
 
     # ------------------------------------------------------------------
     # GRÁFICO 2: VOLUME SEMANAL DE CORRIDA E PACE
     # ------------------------------------------------------------------
-    st.markdown("### 🏃 Volume semanal de corrida e ritmo (pace)")
+    titulo_secao("Volume semanal de corrida e ritmo", subtitulo="Quilometragem semanal comparada ao pace médio.")
     dados_corrida = df_corrida.dropna(subset=["distancia_real_km"]).copy()
     if dados_corrida.empty:
         st.info("Ainda não há corridas registradas.")
@@ -627,21 +939,23 @@ def pagina_evolucao():
         semanal = dados_corrida.resample("W").agg({"distancia_real_km": "sum", "pace_real": "mean"}).reset_index()
 
         fig_corrida = go.Figure()
-        fig_corrida.add_trace(go.Bar(x=semanal["data"], y=semanal["distancia_real_km"], name="Km na semana", yaxis="y1"))
+        fig_corrida.add_trace(go.Bar(x=semanal["data"], y=semanal["distancia_real_km"], name="Km na semana",
+                                      yaxis="y1", marker_color="#3E8BFF"))
         fig_corrida.add_trace(go.Scatter(x=semanal["data"], y=semanal["pace_real"], name="Pace médio (min/km)",
-                                          yaxis="y2", mode="lines+markers"))
+                                          yaxis="y2", mode="lines+markers", line=dict(color="#39FF88")))
         fig_corrida.update_layout(
             xaxis=dict(title="Semana"),
             yaxis=dict(title="Distância (km)"),
             yaxis2=dict(title="Pace (min/km)", overlaying="y", side="right"),
             legend=dict(orientation="h", yanchor="bottom", y=1.02),
+            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", font_color="#F2F4F8",
         )
         st.plotly_chart(fig_corrida, use_container_width=True)
 
     # ------------------------------------------------------------------
     # GRÁFICO 3: CONSUMO CALÓRICO DIÁRIO VS META
     # ------------------------------------------------------------------
-    st.markdown("### 🥗 Consumo calórico diário vs. meta")
+    titulo_secao("Consumo calórico diário vs. meta")
     if df_dieta.empty:
         st.info("Ainda não há dados de dieta registrados.")
     else:
@@ -655,11 +969,14 @@ def pagina_evolucao():
         else:
             fig_dieta = go.Figure()
             fig_dieta.add_trace(go.Scatter(x=cal_dia["data"], y=cal_dia["calorias_prescritas"],
-                                            name="Meta (kcal)", mode="lines+markers"))
+                                            name="Meta (kcal)", mode="lines+markers", line=dict(color="#3E8BFF")))
             fig_dieta.add_trace(go.Scatter(x=cal_dia["data"], y=cal_dia["calorias_consumidas"],
-                                            name="Consumido (kcal)", mode="lines+markers"))
-            fig_dieta.update_layout(xaxis_title="Data", yaxis_title="Calorias (kcal)",
-                                     legend=dict(orientation="h", yanchor="bottom", y=1.02))
+                                            name="Consumido (kcal)", mode="lines+markers", line=dict(color="#39FF88")))
+            fig_dieta.update_layout(
+                xaxis_title="Data", yaxis_title="Calorias (kcal)",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", font_color="#F2F4F8",
+            )
             st.plotly_chart(fig_dieta, use_container_width=True)
 
     st.markdown("---")
@@ -667,11 +984,10 @@ def pagina_evolucao():
     # ------------------------------------------------------------------
     # PREVISÃO DE TENDÊNCIA (REGRESSÃO LINEAR)
     # ------------------------------------------------------------------
-    st.markdown("### 🔮 Previsão de tendência (próximos 30 dias)")
+    titulo_secao("Previsão de tendência", tag="30 dias", subtitulo="Projeção estatística com base no seu histórico.")
 
     col_previsao_musc, col_previsao_corrida = st.columns(2)
 
-    # --- Previsão de carga por exercício ---
     with col_previsao_musc:
         st.markdown("**Musculação — projeção de carga**")
         exercicios_disponiveis = dados_carga["exercicio"].unique().tolist() if not dados_carga.empty else []
@@ -686,15 +1002,18 @@ def pagina_evolucao():
             else:
                 fig_prev = go.Figure()
                 fig_prev.add_trace(go.Scatter(x=dados_ex["data"], y=dados_ex["carga_realizada"],
-                                               mode="markers+lines", name="Histórico"))
+                                               mode="markers+lines", name="Histórico", line=dict(color="#3E8BFF")))
                 fig_prev.add_trace(go.Scatter(x=previsao["data"], y=previsao["valor_previsto"],
-                                               mode="lines", name="Tendência prevista", line=dict(dash="dash")))
-                fig_prev.update_layout(xaxis_title="Data", yaxis_title="Carga (kg)")
+                                               mode="lines", name="Tendência prevista",
+                                               line=dict(dash="dash", color="#39FF88")))
+                fig_prev.update_layout(
+                    xaxis_title="Data", yaxis_title="Carga (kg)",
+                    plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", font_color="#F2F4F8",
+                )
                 st.plotly_chart(fig_prev, use_container_width=True)
-                tendencia_texto = "crescente 📈" if coef > 0 else ("decrescente 📉" if coef < 0 else "estável ➡️")
+                tendencia_texto = "crescente" if coef > 0 else ("decrescente" if coef < 0 else "estável")
                 st.caption(f"Tendência {tendencia_texto} de aproximadamente {coef:.3f} kg/dia.")
 
-    # --- Previsão de distância de corrida ---
     with col_previsao_corrida:
         st.markdown("**Corrida — projeção de distância**")
         if dados_corrida.empty or len(dados_corrida) < 3:
@@ -709,12 +1028,16 @@ def pagina_evolucao():
             else:
                 fig_prev_corrida = go.Figure()
                 fig_prev_corrida.add_trace(go.Scatter(x=dados_corrida_reset["data"], y=dados_corrida_reset["distancia_real_km"],
-                                                        mode="markers+lines", name="Histórico"))
+                                                        mode="markers+lines", name="Histórico", line=dict(color="#3E8BFF")))
                 fig_prev_corrida.add_trace(go.Scatter(x=previsao_corrida["data"], y=previsao_corrida["valor_previsto"],
-                                                        mode="lines", name="Tendência prevista", line=dict(dash="dash")))
-                fig_prev_corrida.update_layout(xaxis_title="Data", yaxis_title="Distância (km)")
+                                                        mode="lines", name="Tendência prevista",
+                                                        line=dict(dash="dash", color="#39FF88")))
+                fig_prev_corrida.update_layout(
+                    xaxis_title="Data", yaxis_title="Distância (km)",
+                    plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", font_color="#F2F4F8",
+                )
                 st.plotly_chart(fig_prev_corrida, use_container_width=True)
-                tendencia_texto_c = "crescente 📈" if coef_corrida > 0 else ("decrescente 📉" if coef_corrida < 0 else "estável ➡️")
+                tendencia_texto_c = "crescente" if coef_corrida > 0 else ("decrescente" if coef_corrida < 0 else "estável")
                 st.caption(f"Tendência {tendencia_texto_c} de aproximadamente {coef_corrida:.3f} km/dia.")
 
     st.markdown("---")
@@ -722,7 +1045,7 @@ def pagina_evolucao():
     # ------------------------------------------------------------------
     # MÉTRICAS DE ERRO (MAE / RMSE)
     # ------------------------------------------------------------------
-    st.markdown("### 📐 Métricas de erro (Prescrito vs. Realizado)")
+    titulo_secao("Métricas de erro", subtitulo="Diferença média entre o prescrito e o realizado.")
 
     mae_carga, rmse_carga, n_carga = calcular_erro(df_musc["carga_prescrita"], df_musc["carga_realizada"])
     mae_dist, rmse_dist, n_dist = calcular_erro(df_corrida["distancia_prescrita_km"], df_corrida["distancia_real_km"])
@@ -753,11 +1076,10 @@ def pagina_evolucao():
     # ------------------------------------------------------------------
     # PAINEL DE INTERPRETAÇÃO GERENCIAL (FEEDBACK AUTOMÁTICO)
     # ------------------------------------------------------------------
-    st.markdown("### 🧭 Interpretação gerencial")
+    titulo_secao("Interpretação gerencial", subtitulo="Leitura automática dos seus resultados recentes.")
 
     mensagens = []
 
-    # Interpretação da progressão de carga
     if not dados_carga.empty:
         for ex in dados_carga["exercicio"].unique():
             serie = dados_carga[dados_carga["exercicio"] == ex]
@@ -765,33 +1087,31 @@ def pagina_evolucao():
                 _, coef = prever_tendencia(serie["data"], serie["carga_realizada"])
                 if coef is not None:
                     if coef > 0.05:
-                        mensagens.append(("success", f"Sua progressão de carga em **{ex}** está crescente — ótimo trabalho!"))
+                        mensagens.append(("success", f"Sua progressão de carga em **{ex}** está crescente."))
                     elif coef < -0.05:
                         mensagens.append(("warning", f"Atenção: sua carga em **{ex}** apresenta tendência de queda."))
                     else:
                         mensagens.append(("info", f"Sua progressão de carga em **{ex}** está estável."))
 
-    # Interpretação de adesão à dieta
     if refeicoes_prescritas > 0:
         soma_prescrita = df_dieta["calorias_prescritas"].sum()
         soma_consumida = df_dieta["calorias_consumidas"].sum()
         if soma_prescrita > 0:
             variacao = (soma_consumida - soma_prescrita) / soma_prescrita * 100
             if variacao > 10:
-                mensagens.append(("warning", f"Atenção: seu consumo calórico está {variacao:.0f}% acima do prescrito."))
+                mensagens.append(("warning", f"Seu consumo calórico está {variacao:.0f}% acima do prescrito."))
             elif variacao < -10:
-                mensagens.append(("warning", f"Atenção: seu consumo calórico está {abs(variacao):.0f}% abaixo do prescrito."))
+                mensagens.append(("warning", f"Seu consumo calórico está {abs(variacao):.0f}% abaixo do prescrito."))
             else:
                 mensagens.append(("success", "Seu consumo calórico está alinhado com o prescrito."))
 
-    # Interpretação de adesão a treino e corrida
     if dias_com_treino_prescrito > 0:
         if adesao_treino >= 80:
-            mensagens.append(("success", f"Excelente adesão à musculação: {adesao_treino:.0f}% dos treinos prescritos foram cumpridos."))
+            mensagens.append(("success", f"Excelente adesão à musculação: {adesao_treino:.0f}% dos treinos cumpridos."))
         elif adesao_treino >= 50:
-            mensagens.append(("info", f"Adesão moderada à musculação: {adesao_treino:.0f}% dos treinos prescritos foram cumpridos."))
+            mensagens.append(("info", f"Adesão moderada à musculação: {adesao_treino:.0f}% dos treinos cumpridos."))
         else:
-            mensagens.append(("warning", f"Baixa adesão à musculação: apenas {adesao_treino:.0f}% dos treinos prescritos foram cumpridos."))
+            mensagens.append(("warning", f"Baixa adesão à musculação: apenas {adesao_treino:.0f}% dos treinos cumpridos."))
 
     if corridas_prescritas > 0:
         if adesao_corrida >= 80:
@@ -816,9 +1136,9 @@ def pagina_evolucao():
 # ---------------------------------------------------------------------------
 # ROTEAMENTO ENTRE PÁGINAS
 # ---------------------------------------------------------------------------
-if pagina == "🏠 Início":
+if pagina == "Início":
     pagina_inicio()
-elif pagina == "📔 Diário":
+elif pagina == "Diário":
     pagina_diario()
-elif pagina == "📈 Evolução":
+elif pagina == "Evolução":
     pagina_evolucao()
