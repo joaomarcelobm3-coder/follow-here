@@ -1,9 +1,5 @@
-streamlit
-pandas
-numpy
-plotly
-scikit-learn
-icalendar
-python-dateutil
-requests
-gpxpy
+streamlit>=1.35
+pandas>=2.0
+requests>=2.31
+icalendar>=5.0
+plotly>=5.20
