@@ -53,6 +53,7 @@ import gpxpy
 from icalendar import Calendar
 from dateutil.rrule import rrulestr
 from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
@@ -259,6 +260,17 @@ URL_ICAL_RUNNA_PADRAO = (
     "%40group.calendar.google.com/private-c5a8b552f806d8d94ba6cce90a111c21/basic.ics"
 )
 
+# Fuso horário local usado para converter os horários do iCal (geralmente em
+# UTC) para a data "de calendário" correta, evitando que um evento perto da
+# meia-noite caia no dia errado.
+FUSO_HORARIO_LOCAL = ZoneInfo("America/Fortaleza")
+
+# Regra de negócio do calendário do usuário:
+#   - de DATA_CORTE_REALIZADO até "hoje" (exclusive)  -> treino REALIZADO
+#   - de "hoje" (inclusive) em diante                  -> treino PLANEJADO
+#   - antes de DATA_CORTE_REALIZADO                    -> fora da regra (ignorado na sincronização automática)
+DATA_CORTE_REALIZADO = date(2026, 8, 17)
+
 COLUNAS_MUSCULACAO = [
     "data", "exercicio",
     "series_prescritas", "reps_prescritas", "carga_prescrita",
@@ -438,27 +450,41 @@ def buscar_eventos_ical(url_ical):
 
 
 def _extrair_dia(valor_dt):
-    """Converte um valor de DTSTART (date ou datetime) para um date puro."""
+    """
+    Converte um valor de DTSTART (date ou datetime, com ou sem timezone)
+    para um date puro NO FUSO HORÁRIO LOCAL. Eventos vindos do Google
+    Calendar costumam trazer DTSTART em UTC (ou com um TZID próprio); sem
+    essa conversão, um treino registrado às 21h ou 22h no horário local
+    pode "vazar" para o dia seguinte em UTC e cair na data errada do app.
+    Eventos de dia inteiro (sem hora, apenas `date`) não sofrem conversão.
+    """
     if isinstance(valor_dt, datetime):
+        if valor_dt.tzinfo is not None:
+            valor_dt = valor_dt.astimezone(FUSO_HORARIO_LOCAL)
         return valor_dt.date()
     return valor_dt
 
 
 def evento_ocorre_na_data(evento, data_alvo):
     """
-    Verifica se um VEVENT do iCal ocorre na data_alvo, cobrindo tanto
-    eventos únicos quanto eventos recorrentes (campo RRULE), expandindo a
-    regra de recorrência até a data alvo.
+    Verifica se um VEVENT do iCal ocorre na data_alvo (já considerando o
+    fuso horário local), cobrindo tanto eventos únicos quanto eventos
+    recorrentes (campo RRULE). A janela de busca da recorrência é alargada
+    em ±1 dia para não perder ocorrências que "atravessam" a meia-noite ao
+    converter de UTC para o horário local.
     """
     dtstart = evento.get("dtstart")
     if dtstart is None:
         return False
 
-    inicio = _extrair_dia(dtstart.dt)
-    if inicio == data_alvo:
+    valor_inicio = dtstart.dt
+    if _extrair_dia(valor_inicio) == data_alvo:
         return True
 
-    if inicio > data_alvo:
+    # Data de início (sem conversão de fuso) só para descartar rapidamente
+    # eventos cujo início é claramente posterior à data alvo.
+    inicio_bruto = valor_inicio.date() if isinstance(valor_inicio, datetime) else valor_inicio
+    if inicio_bruto > data_alvo + timedelta(days=1):
         return False
 
     campo_rrule = evento.get("rrule")
@@ -467,13 +493,104 @@ def evento_ocorre_na_data(evento, data_alvo):
 
     try:
         regra_texto = campo_rrule.to_ical().decode("utf-8")
-        inicio_dt = dtstart.dt if isinstance(dtstart.dt, datetime) else datetime.combine(dtstart.dt, datetime.min.time())
+        inicio_dt = valor_inicio if isinstance(valor_inicio, datetime) else datetime.combine(valor_inicio, datetime.min.time())
         regra = rrulestr(f"RRULE:{regra_texto}", dtstart=inicio_dt)
-        limite = datetime.combine(data_alvo + timedelta(days=1), datetime.min.time())
-        ocorrencias = regra.between(inicio_dt, limite, inc=True)
-        return any(ocorrencia.date() == data_alvo for ocorrencia in ocorrencias)
+
+        # Janela alargada (±1 dia) para absorver o deslocamento de fuso
+        # horário na conversão final feita por _extrair_dia.
+        limite_inicio = datetime.combine(data_alvo - timedelta(days=1), datetime.min.time())
+        limite_fim = datetime.combine(data_alvo + timedelta(days=2), datetime.min.time())
+        if inicio_dt.tzinfo is not None:
+            limite_inicio = limite_inicio.replace(tzinfo=inicio_dt.tzinfo)
+            limite_fim = limite_fim.replace(tzinfo=inicio_dt.tzinfo)
+
+        ocorrencias = regra.between(limite_inicio, limite_fim, inc=True)
+        return any(_extrair_dia(ocorrencia) == data_alvo for ocorrencia in ocorrencias)
     except Exception:
         return False
+
+
+def classificar_periodo_evento(data_evento, hoje=None, data_corte=DATA_CORTE_REALIZADO):
+    """
+    Classifica a data de um evento do calendário de acordo com a regra do
+    usuário:
+      - antes de `data_corte`               -> None (fora da regra, ignorar)
+      - [data_corte, hoje)                   -> "realizado" (já aconteceu)
+      - hoje (inclusive) em diante (futuro)  -> "planejado"
+    """
+    hoje = hoje or date.today()
+    if data_evento < data_corte:
+        return None
+    if data_evento < hoje:
+        return "realizado"
+    return "planejado"
+
+
+def sincronizar_periodo_calendario(url_ical, data_inicio, data_fim, hoje=None,
+                                    data_corte=DATA_CORTE_REALIZADO,
+                                    retropreencher_planejado=False):
+    """
+    Varre um intervalo [data_inicio, data_fim] do calendário iCal e grava
+    cada evento encontrado na coluna correta — REALIZADO ou PLANEJADO — de
+    acordo com `classificar_periodo_evento`.
+
+    `retropreencher_planejado`: quando True, além de gravar o REALIZADO
+    para datas passadas (dentro da regra), também grava/atualiza a coluna
+    de PLANEJADO com os mesmos dados do evento para essa data — útil para
+    reconstruir o comparativo "planejado x realizado" de dias que já
+    passaram. Isso NUNCA sobrescreve os dados já gravados como REALIZADO:
+    as colunas de planejado e de realizado são sempre atualizadas de forma
+    totalmente independente (ver `salvar_prescricao_corrida` e
+    `salvar_realizado_corrida`, que só tocam nos seus próprios campos).
+
+    Retorna um dicionário com a contagem de dias processados em cada
+    categoria, para exibir um resumo ao usuário na interface.
+    """
+    hoje = hoje or date.today()
+    eventos = buscar_eventos_ical(url_ical)
+
+    resumo = {"realizado": 0, "planejado": 0, "retropreenchido": 0, "sem_evento": 0, "ignorado_pre_corte": 0}
+
+    data_atual = data_inicio
+    while data_atual <= data_fim:
+        evento_do_dia = next(
+            (evento for evento in eventos if evento_ocorre_na_data(evento, data_atual)),
+            None,
+        )
+
+        if evento_do_dia is None:
+            resumo["sem_evento"] += 1
+            data_atual += timedelta(days=1)
+            continue
+
+        periodo = classificar_periodo_evento(data_atual, hoje=hoje, data_corte=data_corte)
+        if periodo is None:
+            resumo["ignorado_pre_corte"] += 1
+            data_atual += timedelta(days=1)
+            continue
+
+        metricas = extrair_metricas_planejadas(evento_do_dia)
+        distancia = metricas["distancia"] if metricas["distancia"] is not None else 0.0
+        tempo = metricas["tempo"] if metricas["tempo"] is not None else 0.0
+        descricao = metricas["descricao"]
+
+        if periodo == "realizado":
+            salvar_realizado_corrida(
+                data_atual, distancia, tempo,
+                comentarios=descricao, laps_texto="", fonte="Google Calendar (auto)",
+            )
+            resumo["realizado"] += 1
+
+            if retropreencher_planejado:
+                salvar_prescricao_corrida(data_atual, distancia, tempo, descricao)
+                resumo["retropreenchido"] += 1
+        else:
+            salvar_prescricao_corrida(data_atual, distancia, tempo, descricao)
+            resumo["planejado"] += 1
+
+        data_atual += timedelta(days=1)
+
+    return resumo
 
 
 def extrair_metricas_planejadas(evento):
@@ -1072,6 +1189,45 @@ def pagina_diario():
                     st.success("Treino planejado sincronizado e salvo.")
                     st.session_state.pop("preview_ical", None)
                     st.rerun()
+
+        with st.expander("Sincronizar um período inteiro (realizado x planejado automático)"):
+            st.caption(
+                f"Eventos entre {DATA_CORTE_REALIZADO.strftime('%d/%m/%Y')} e hoje são gravados como "
+                "TREINO REALIZADO; eventos de hoje em diante são gravados como TREINO PLANEJADO."
+            )
+            pcol1, pcol2 = st.columns(2)
+            data_inicio_sync = pcol1.date_input(
+                "De", value=DATA_CORTE_REALIZADO, key="sync_periodo_inicio",
+            )
+            data_fim_sync = pcol2.date_input(
+                "Até", value=date.today() + timedelta(days=14), key="sync_periodo_fim",
+            )
+            retropreencher = st.checkbox(
+                "Também retropreencher o PLANEJADO do período passado "
+                "(sem apagar o REALIZADO já gravado nessas datas)",
+                value=False, key="sync_retropreencher_planejado",
+            )
+            if st.button("Sincronizar período", use_container_width=True, key="btn_sync_periodo"):
+                if data_inicio_sync > data_fim_sync:
+                    st.error("A data 'De' não pode ser posterior à data 'Até'.")
+                else:
+                    try:
+                        resumo_sync = sincronizar_periodo_calendario(
+                            st.session_state.get("url_ical_runna", URL_ICAL_RUNNA_PADRAO),
+                            data_inicio_sync, data_fim_sync,
+                            retropreencher_planejado=retropreencher,
+                        )
+                        st.success(
+                            f"Sincronização concluída — Realizado: {resumo_sync['realizado']} · "
+                            f"Planejado: {resumo_sync['planejado']} · "
+                            f"Retropreenchido: {resumo_sync['retropreenchido']} · "
+                            f"Sem evento: {resumo_sync['sem_evento']} · "
+                            f"Fora da regra (antes de {DATA_CORTE_REALIZADO.strftime('%d/%m/%Y')}): "
+                            f"{resumo_sync['ignorado_pre_corte']}"
+                        )
+                        st.rerun()
+                    except Exception as erro:
+                        st.error(f"Não foi possível sincronizar o período: {erro}")
 
         with st.expander("Editar meta manualmente"):
             with st.form("form_prescricao_corrida_manual", clear_on_submit=True):
