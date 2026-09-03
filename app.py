@@ -16,15 +16,16 @@ Cadastro em lote: musculação e dieta usam st.data_editor, permitindo
 preencher vários exercícios ou refeições de uma só vez, com um único
 clique para salvar.
 
-Corrida — fluxo sem API do Strava (bloqueada para contas gratuitas):
-- PLANEJADO: sincronização com a agenda do Runna via link iCal (.ics),
-  usando a biblioteca `icalendar` para localizar o evento do dia e extrair
-  distância, tempo e a descrição do treino (aquecimento, tiros, desaquecimento).
-- REALIZADO: importação gratuita de arquivo .gpx / .tcx exportado do
-  Strava, Garmin ou Apple Watch (via `gpxpy` para GPX e um parser XML
-  próprio para TCX), com extração automática de distância, tempo, pace
-  médio formatado e resumo dos laps/tiros. Também há um formulário manual
-  rápido para os dias em que o usuário preferir digitar os dados.
+Corrida — fluxo sem API do Strava (bloqueada para contas gratuitas), 100%
+baseado no Google Calendar / Runna via link iCal (.ics):
+- Um único botão sincroniza o histórico inteiro desde 17/08/2026 até
+  datas futuras.
+- Eventos entre 17/08/2026 e HOJE (exclusive) são gravados como TREINO
+  REALIZADO; eventos de HOJE em diante são gravados como TREINO
+  PLANEJADO. Registros já existentes na mesma data são atualizados
+  (nunca duplicados).
+- Um expander opcional "Editar registro manualmente" permite corrigir
+  distância/tempo caso o iCal falhe ou esteja incompleto.
 
 Dependências (requirements.txt):
     streamlit
@@ -35,13 +36,11 @@ Dependências (requirements.txt):
     icalendar
     python-dateutil
     requests
-    gpxpy
 """
 
 import os
 import re
 import html
-import xml.etree.ElementTree as ET
 
 import streamlit as st
 import pandas as pd
@@ -49,7 +48,6 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 import requests
-import gpxpy
 from icalendar import Calendar
 from dateutil.rrule import rrulestr
 from datetime import date, datetime, timedelta
@@ -271,6 +269,10 @@ FUSO_HORARIO_LOCAL = ZoneInfo("America/Fortaleza")
 #   - antes de DATA_CORTE_REALIZADO                    -> fora da regra (ignorado na sincronização automática)
 DATA_CORTE_REALIZADO = date(2026, 8, 17)
 
+# Até quantos dias no futuro a sincronização automática deve buscar treinos
+# planejados no calendário (ajustável conforme o horizonte do seu plano).
+FUTURO_DIAS_SINCRONIZACAO = 60
+
 COLUNAS_MUSCULACAO = [
     "data", "exercicio",
     "series_prescritas", "reps_prescritas", "carga_prescrita",
@@ -278,7 +280,7 @@ COLUNAS_MUSCULACAO = [
 ]
 COLUNAS_CORRIDA = [
     "data",
-    "distancia_prescrita_km", "tempo_prescrito_min", "descricao_planejada",
+    "distancia_prescrita_km", "tempo_prescrito_min", "descricao_planejada", "fonte_planejado",
     "distancia_real_km", "tempo_real_min", "pace_real",
     "comentarios", "laps_realizados", "fonte_realizado",
 ]
@@ -293,7 +295,7 @@ TIPOS_REFEICAO = ["Café da manhã", "Almoço", "Lanche", "Jantar"]
 # 'object' (string), pois quando ficam totalmente vazias o Pandas as infere
 # como float64 — e gravar uma string nelas depois causa TypeError.
 COLUNAS_TEXTO_MUSCULACAO = ["exercicio"]
-COLUNAS_TEXTO_CORRIDA = ["descricao_planejada", "comentarios", "laps_realizados", "fonte_realizado"]
+COLUNAS_TEXTO_CORRIDA = ["descricao_planejada", "fonte_planejado", "comentarios", "laps_realizados", "fonte_realizado"]
 COLUNAS_TEXTO_DIETA = ["refeicao", "prescrito", "alimento_consumido"]
 
 
@@ -510,48 +512,32 @@ def evento_ocorre_na_data(evento, data_alvo):
         return False
 
 
-def classificar_periodo_evento(data_evento, hoje=None, data_corte=DATA_CORTE_REALIZADO):
+def sincronizar_calendario_completo(url_ical, hoje=None):
     """
-    Classifica a data de um evento do calendário de acordo com a regra do
-    usuário:
-      - antes de `data_corte`               -> None (fora da regra, ignorar)
-      - [data_corte, hoje)                   -> "realizado" (já aconteceu)
-      - hoje (inclusive) em diante (futuro)  -> "planejado"
-    """
-    hoje = hoje or date.today()
-    if data_evento < data_corte:
-        return None
-    if data_evento < hoje:
-        return "realizado"
-    return "planejado"
+    Sincronização em 1 clique: varre o calendário iCal inteiro, do dia
+    DATA_CORTE_REALIZADO até `FUTURO_DIAS_SINCRONIZACAO` dias no futuro, e
+    grava cada evento encontrado na coluna correta:
 
+      - [DATA_CORTE_REALIZADO, hoje)  -> TREINO REALIZADO (já aconteceu).
+        Para permitir o comparativo planejado x realizado nesses dias
+        passados, os mesmos dados do evento também são gravados no
+        PLANEJADO daquela data (mesma fonte: o calendário só tem 1 evento
+        por dia nesse período).
+      - hoje (inclusive) em diante     -> TREINO PLANEJADO (futuro).
 
-def sincronizar_periodo_calendario(url_ical, data_inicio, data_fim, hoje=None,
-                                    data_corte=DATA_CORTE_REALIZADO,
-                                    retropreencher_planejado=False):
-    """
-    Varre um intervalo [data_inicio, data_fim] do calendário iCal e grava
-    cada evento encontrado na coluna correta — REALIZADO ou PLANEJADO — de
-    acordo com `classificar_periodo_evento`.
+    Registros já existentes na mesma data são ATUALIZADOS, nunca
+    duplicados (ver `salvar_prescricao_corrida` / `salvar_realizado_corrida`).
 
-    `retropreencher_planejado`: quando True, além de gravar o REALIZADO
-    para datas passadas (dentro da regra), também grava/atualiza a coluna
-    de PLANEJADO com os mesmos dados do evento para essa data — útil para
-    reconstruir o comparativo "planejado x realizado" de dias que já
-    passaram. Isso NUNCA sobrescreve os dados já gravados como REALIZADO:
-    as colunas de planejado e de realizado são sempre atualizadas de forma
-    totalmente independente (ver `salvar_prescricao_corrida` e
-    `salvar_realizado_corrida`, que só tocam nos seus próprios campos).
-
-    Retorna um dicionário com a contagem de dias processados em cada
-    categoria, para exibir um resumo ao usuário na interface.
+    Retorna um dicionário com a contagem de dias processados, para exibir
+    um resumo de status ao usuário.
     """
     hoje = hoje or date.today()
+    data_fim = hoje + timedelta(days=FUTURO_DIAS_SINCRONIZACAO)
+
     eventos = buscar_eventos_ical(url_ical)
+    resumo = {"realizado": 0, "planejado": 0, "sem_evento": 0}
 
-    resumo = {"realizado": 0, "planejado": 0, "retropreenchido": 0, "sem_evento": 0, "ignorado_pre_corte": 0}
-
-    data_atual = data_inicio
+    data_atual = DATA_CORTE_REALIZADO
     while data_atual <= data_fim:
         evento_do_dia = next(
             (evento for evento in eventos if evento_ocorre_na_data(evento, data_atual)),
@@ -563,29 +549,23 @@ def sincronizar_periodo_calendario(url_ical, data_inicio, data_fim, hoje=None,
             data_atual += timedelta(days=1)
             continue
 
-        periodo = classificar_periodo_evento(data_atual, hoje=hoje, data_corte=data_corte)
-        if periodo is None:
-            resumo["ignorado_pre_corte"] += 1
-            data_atual += timedelta(days=1)
-            continue
-
         metricas = extrair_metricas_planejadas(evento_do_dia)
         distancia = metricas["distancia"] if metricas["distancia"] is not None else 0.0
         tempo = metricas["tempo"] if metricas["tempo"] is not None else 0.0
         descricao = metricas["descricao"]
 
-        if periodo == "realizado":
+        if data_atual < hoje:
+            # Período histórico -> grava REALIZADO e também espelha no
+            # PLANEJADO da mesma data para viabilizar o comparativo.
             salvar_realizado_corrida(
                 data_atual, distancia, tempo,
                 comentarios=descricao, laps_texto="", fonte="Google Calendar (auto)",
             )
+            salvar_prescricao_corrida(data_atual, distancia, tempo, descricao, fonte="Google Calendar (auto)")
             resumo["realizado"] += 1
-
-            if retropreencher_planejado:
-                salvar_prescricao_corrida(data_atual, distancia, tempo, descricao)
-                resumo["retropreenchido"] += 1
         else:
-            salvar_prescricao_corrida(data_atual, distancia, tempo, descricao)
+            # Hoje ou futuro -> só PLANEJADO.
+            salvar_prescricao_corrida(data_atual, distancia, tempo, descricao, fonte="Google Calendar (auto)")
             resumo["planejado"] += 1
 
         data_atual += timedelta(days=1)
@@ -624,21 +604,22 @@ def extrair_metricas_planejadas(evento):
     return {"distancia": distancia, "tempo": tempo, "descricao": descricao_final}
 
 
-def salvar_prescricao_corrida(data_ref, distancia, tempo, descricao=""):
-    """Cria ou atualiza a meta de corrida (distância/tempo/descrição) de uma data."""
+def salvar_prescricao_corrida(data_ref, distancia, tempo, descricao="", fonte="Manual"):
+    """Cria ou atualiza a meta de corrida (distância/tempo/descrição/fonte) de uma data."""
     df = st.session_state["corrida"]
     df = garantir_dtype_texto(df, COLUNAS_TEXTO_CORRIDA)
     filtro = df["data"] == data_ref
 
     if filtro.any():
         idx = df[filtro].index[0]
-        df.loc[idx, ["distancia_prescrita_km", "tempo_prescrito_min", "descricao_planejada"]] = [
-            distancia, tempo, descricao,
+        df.loc[idx, ["distancia_prescrita_km", "tempo_prescrito_min", "descricao_planejada", "fonte_planejado"]] = [
+            distancia, tempo, descricao, fonte,
         ]
     else:
         nova_linha = {
             "data": data_ref,
-            "distancia_prescrita_km": distancia, "tempo_prescrito_min": tempo, "descricao_planejada": descricao,
+            "distancia_prescrita_km": distancia, "tempo_prescrito_min": tempo,
+            "descricao_planejada": descricao, "fonte_planejado": fonte,
             "distancia_real_km": np.nan, "tempo_real_min": np.nan, "pace_real": np.nan,
             "comentarios": np.nan, "laps_realizados": np.nan, "fonte_realizado": np.nan,
         }
@@ -648,7 +629,7 @@ def salvar_prescricao_corrida(data_ref, distancia, tempo, descricao=""):
 
 
 # ---------------------------------------------------------------------------
-# FUNÇÕES AUXILIARES - CORRIDA (REALIZADO VIA GPX / TCX OU MANUAL)
+# FUNÇÕES AUXILIARES - CORRIDA (REALIZADO)
 # ---------------------------------------------------------------------------
 def formatar_pace(min_por_km):
     """Formata um pace em min/km decimal para o formato MM'SS"/km."""
@@ -662,105 +643,11 @@ def formatar_pace(min_por_km):
     return f"{minutos:02d}'{segundos:02d}\"/km"
 
 
-def formatar_resumo_laps(laps):
-    """Converte a lista de laps/tiros extraídos do arquivo em texto legível para exibição e armazenamento."""
-    if not laps:
-        return ""
-    linhas = []
-    for item in laps:
-        pace_lap = item["tempo_min"] / item["distancia_km"] if item["distancia_km"] > 0 else None
-        linhas.append(
-            f"{item['lap']}: {item['distancia_km']} km em {item['tempo_min']} min "
-            f"(pace {formatar_pace(pace_lap)})"
-        )
-    return "\n".join(linhas)
-
-
-def processar_arquivo_gpx(arquivo):
+def salvar_realizado_corrida(data_ref, distancia, tempo, comentarios="", laps_texto="", fonte="Manual"):
     """
-    Faz o parse de um arquivo .gpx (exportado do Strava, Garmin ou Apple
-    Watch) usando a biblioteca `gpxpy`, retornando distância total (km),
-    tempo total (min) e o resumo por trilha/segmento (laps).
-    """
-    gpx = gpxpy.parse(arquivo)
-    distancia_total_m = 0.0
-    todos_os_pontos = []
-    laps = []
-
-    for i, trilha in enumerate(gpx.tracks):
-        for j, segmento in enumerate(trilha.segments):
-            distancia_segmento_m = segmento.length_3d() or segmento.length_2d() or 0.0
-            distancia_total_m += distancia_segmento_m
-            todos_os_pontos.extend(segmento.points)
-
-            if segmento.points and segmento.points[0].time and segmento.points[-1].time:
-                tempo_segmento_min = (segmento.points[-1].time - segmento.points[0].time).total_seconds() / 60
-            else:
-                tempo_segmento_min = 0.0
-
-            laps.append({
-                "lap": f"Trilha {i + 1} / Segmento {j + 1}",
-                "distancia_km": distancia_segmento_m / 1000,
-                "tempo_min": tempo_segmento_min,
-            })
-
-    if len(todos_os_pontos) >= 2 and todos_os_pontos[0].time and todos_os_pontos[-1].time:
-        tempo_total_min = (todos_os_pontos[-1].time - todos_os_pontos[0].time).total_seconds() / 60
-    else:
-        tempo_total_min = sum(lap["tempo_min"] for lap in laps)
-
-    return {
-        "distancia_km": distancia_total_m / 1000,
-        "tempo_min": tempo_total_min,
-        "laps": laps,
-    }
-
-
-NAMESPACE_TCX = {"tcx": "http://www.garmin.com/xmlschema/TrainingCenterDatabase/v2"}
-
-
-def processar_arquivo_tcx(arquivo):
-    """
-    Faz o parse de um arquivo .tcx (Garmin/Apple Watch/Strava) por meio de
-    leitura XML direta, somando as voltas (Lap) para obter a distância e o
-    tempo totais, e retornando o resumo de cada volta.
-    """
-    arvore = ET.parse(arquivo)
-    raiz = arvore.getroot()
-
-    distancia_total_m = 0.0
-    tempo_total_s = 0.0
-    laps = []
-
-    for i, lap in enumerate(raiz.findall(".//tcx:Lap", NAMESPACE_TCX)):
-        no_tempo = lap.find("tcx:TotalTimeSeconds", NAMESPACE_TCX)
-        no_distancia = lap.find("tcx:DistanceMeters", NAMESPACE_TCX)
-
-        tempo_lap_s = float(no_tempo.text) if no_tempo is not None and no_tempo.text else 0.0
-        distancia_lap_m = float(no_distancia.text) if no_distancia is not None and no_distancia.text else 0.0
-
-        distancia_total_m += distancia_lap_m
-        tempo_total_s += tempo_lap_s
-
-        laps.append({
-            "lap": f"Volta {i + 1}",
-            "distancia_km": distancia_lap_m / 1000,
-            "tempo_min": tempo_lap_s / 60,
-        })
-
-    return {
-        "distancia_km": distancia_total_m / 1000,
-        "tempo_min": tempo_total_s / 60,
-        "laps": laps,
-    }
-
-
-def salvar_realizado_corrida(data_ref, distancia, tempo, comentarios="", laps_texto="", fonte="Registro manual"):
-    """
-    Registra a corrida realizada — vinda de um arquivo importado (.gpx/.tcx)
-    ou de um registro manual — calculando o pace (min/km) automaticamente e
-    salvando comentários, o resumo de laps/tiros (quando houver) e a fonte
-    do registro (arquivo importado ou manual).
+    Registra a corrida realizada — vinda da sincronização automática com o
+    calendário ou de um ajuste manual — calculando o pace (min/km)
+    automaticamente e salvando comentários e a fonte do registro.
     """
     pace = tempo / distancia if distancia > 0 else np.nan
     comentarios = comentarios.strip() if isinstance(comentarios, str) else comentarios
@@ -777,7 +664,8 @@ def salvar_realizado_corrida(data_ref, distancia, tempo, comentarios="", laps_te
     else:
         nova_linha = {
             "data": data_ref,
-            "distancia_prescrita_km": np.nan, "tempo_prescrito_min": np.nan, "descricao_planejada": np.nan,
+            "distancia_prescrita_km": np.nan, "tempo_prescrito_min": np.nan,
+            "descricao_planejada": np.nan, "fonte_planejado": np.nan,
             "distancia_real_km": distancia, "tempo_real_min": tempo, "pace_real": pace,
             "comentarios": comentarios, "laps_realizados": laps_texto, "fonte_realizado": fonte,
         }
@@ -918,8 +806,8 @@ st.sidebar.caption(
     "Seus registros são salvos automaticamente em arquivos CSV locais "
     "(dados_musculacao.csv, dados_corrida.csv, dados_dieta.csv) e "
     "permanecem disponíveis mesmo após reiniciar o aplicativo. "
-    "A corrida planejada é sincronizada via link iCal do Runna, e a corrida "
-    "realizada pode ser importada de arquivos GPX/TCX ou registrada manualmente."
+    "A corrida é 100% sincronizada com o Google Calendar (Runna) via link iCal: "
+    "eventos passados viram realizado, eventos futuros viram planejado."
 )
 
 
@@ -1112,272 +1000,198 @@ def pagina_diario():
     # SUB-ABA CORRIDA
     # ------------------------------------------------------------------
     with aba_corrida:
-        titulo_secao("Treino planejado", tag="Planejado")
         df_corrida = st.session_state["corrida"]
-        meta_dia = df_corrida[df_corrida["data"] == data_selecionada]
-        ha_meta_salva = not meta_dia.empty and pd.notna(meta_dia.iloc[0].get("distancia_prescrita_km"))
+        hoje = date.today()
 
-        if ha_meta_salva:
-            linha_meta = meta_dia.iloc[0]
-            c1, c2 = st.columns(2)
-            c1.metric("Distância meta", f"{linha_meta['distancia_prescrita_km']} km")
-            c2.metric("Tempo meta", f"{linha_meta['tempo_prescrito_min']} min")
-            descricao_plan = linha_meta.get("descricao_planejada", "")
-            if isinstance(descricao_plan, str) and descricao_plan.strip():
-                st.markdown(
-                    f"""
-                    <div class="fh-card">
-                        <h4>Descrição do treino planejado</h4>
-                        <p style="white-space:pre-wrap;">{html.escape(descricao_plan.strip())}</p>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-        else:
-            st.info("Nenhum treino planejado carregado para esta data ainda.")
-
-        with st.expander("Sincronizar com o Runna (calendário iCal)", expanded=not ha_meta_salva):
-            st.caption(
-                "Como a criação de API no Strava está bloqueada para contas gratuitas, "
-                "o treino planejado é lido diretamente do link iCal (.ics) exportado pelo Runna."
-            )
-            url_ical = st.text_input(
-                "URL do calendário iCal (Runna / Google Agenda)",
-                value=st.session_state.get("url_ical_runna", URL_ICAL_RUNNA_PADRAO),
-                key="input_url_ical",
-            )
-            st.session_state["url_ical_runna"] = url_ical
-
-            if st.button("Buscar treino do dia no calendário", use_container_width=True, key="btn_sync_ical"):
-                if not url_ical.strip():
-                    st.error("Informe a URL do calendário iCal.")
-                else:
-                    try:
-                        eventos = buscar_eventos_ical(url_ical)
-                        evento_do_dia = next(
-                            (evento for evento in eventos if evento_ocorre_na_data(evento, data_selecionada)),
-                            None,
-                        )
-                        if evento_do_dia is None:
-                            st.warning("Nenhum treino encontrado no calendário para esta data.")
-                            st.session_state.pop("preview_ical", None)
-                        else:
-                            st.session_state["preview_ical"] = extrair_metricas_planejadas(evento_do_dia)
-                    except Exception as erro:
-                        st.error(f"Não foi possível ler o calendário: {erro}")
-
-            preview_ical = st.session_state.get("preview_ical")
-            if preview_ical:
-                st.caption("Prévia do treino encontrado — confira e salve para aplicar ao dia selecionado.")
-                pc1, pc2 = st.columns(2)
-                distancia_editada = pc1.number_input(
-                    "Distância meta (km)", min_value=0.0, step=0.1,
-                    value=float(preview_ical["distancia"]) if preview_ical["distancia"] is not None else 0.0,
-                    key="preview_distancia",
-                )
-                tempo_editado = pc2.number_input(
-                    "Tempo meta (min)", min_value=0.0, step=1.0,
-                    value=float(preview_ical["tempo"]) if preview_ical["tempo"] is not None else 0.0,
-                    key="preview_tempo",
-                )
-                descricao_editada = st.text_area(
-                    "Descrição do treino planejado (aquecimento, tiros, desaquecimento)",
-                    value=preview_ical["descricao"], key="preview_descricao",
-                )
-                if st.button("Salvar treino planejado", use_container_width=True, key="btn_salvar_ical"):
-                    salvar_prescricao_corrida(data_selecionada, distancia_editada, tempo_editado, descricao_editada)
-                    st.success("Treino planejado sincronizado e salvo.")
-                    st.session_state.pop("preview_ical", None)
-                    st.rerun()
-
-        with st.expander("Sincronizar um período inteiro (realizado x planejado automático)"):
-            st.caption(
-                f"Eventos entre {DATA_CORTE_REALIZADO.strftime('%d/%m/%Y')} e hoje são gravados como "
-                "TREINO REALIZADO; eventos de hoje em diante são gravados como TREINO PLANEJADO."
-            )
-            pcol1, pcol2 = st.columns(2)
-            data_inicio_sync = pcol1.date_input(
-                "De", value=DATA_CORTE_REALIZADO, key="sync_periodo_inicio",
-            )
-            data_fim_sync = pcol2.date_input(
-                "Até", value=date.today() + timedelta(days=14), key="sync_periodo_fim",
-            )
-            retropreencher = st.checkbox(
-                "Também retropreencher o PLANEJADO do período passado "
-                "(sem apagar o REALIZADO já gravado nessas datas)",
-                value=False, key="sync_retropreencher_planejado",
-            )
-            if st.button("Sincronizar período", use_container_width=True, key="btn_sync_periodo"):
-                if data_inicio_sync > data_fim_sync:
-                    st.error("A data 'De' não pode ser posterior à data 'Até'.")
-                else:
-                    try:
-                        resumo_sync = sincronizar_periodo_calendario(
-                            st.session_state.get("url_ical_runna", URL_ICAL_RUNNA_PADRAO),
-                            data_inicio_sync, data_fim_sync,
-                            retropreencher_planejado=retropreencher,
-                        )
-                        st.success(
-                            f"Sincronização concluída — Realizado: {resumo_sync['realizado']} · "
-                            f"Planejado: {resumo_sync['planejado']} · "
-                            f"Retropreenchido: {resumo_sync['retropreenchido']} · "
-                            f"Sem evento: {resumo_sync['sem_evento']} · "
-                            f"Fora da regra (antes de {DATA_CORTE_REALIZADO.strftime('%d/%m/%Y')}): "
-                            f"{resumo_sync['ignorado_pre_corte']}"
-                        )
-                        st.rerun()
-                    except Exception as erro:
-                        st.error(f"Não foi possível sincronizar o período: {erro}")
-
-        with st.expander("Editar meta manualmente"):
-            with st.form("form_prescricao_corrida_manual", clear_on_submit=True):
-                col1, col2 = st.columns(2)
-                dist_p = col1.number_input("Distância meta (km)", min_value=0.0, step=0.1, value=0.0)
-                tempo_p = col2.number_input("Tempo meta (min)", min_value=0.0, step=1.0, value=0.0)
-                descricao_p = st.text_area("Descrição do treino planejado (opcional)", value="")
-                enviado = st.form_submit_button("Salvar meta manual", use_container_width=True)
-                if enviado:
-                    salvar_prescricao_corrida(data_selecionada, dist_p, tempo_p, descricao_p)
-                    st.success("Meta de corrida salva manualmente.")
-                    st.rerun()
-
-        st.markdown("---")
-        titulo_secao("Execução real", tag="Realizado")
-
-        modo_registro = st.radio(
-            "Como deseja registrar a execução de hoje?",
-            ["Importar arquivo (GPX/TCX)", "Registro manual rápido"],
-            horizontal=True, key="modo_registro_corrida",
+        # ------------------------------------------------------------------
+        # SINCRONIZAÇÃO EM 1 CLIQUE (GOOGLE CALENDAR / RUNNA)
+        # ------------------------------------------------------------------
+        titulo_secao(
+            "Sincronização com o Google Calendar", tag="Automático",
+            subtitulo=(
+                f"Eventos de {DATA_CORTE_REALIZADO.strftime('%d/%m/%Y')} até hoje viram treino REALIZADO; "
+                "eventos de hoje em diante viram treino PLANEJADO. Registros existentes na mesma data são "
+                "atualizados, nunca duplicados."
+            ),
+        )
+        col_url, col_botao = st.columns([4, 1])
+        url_ical = col_url.text_input(
+            "URL do calendário iCal (Runna / Google Agenda)",
+            value=st.session_state.get("url_ical_runna", URL_ICAL_RUNNA_PADRAO),
+            key="input_url_ical", label_visibility="collapsed",
+        )
+        st.session_state["url_ical_runna"] = url_ical
+        sincronizar_clicado = col_botao.button(
+            "Sincronizar Calendário", use_container_width=True, type="primary", key="btn_sync_calendario",
         )
 
-        if modo_registro == "Importar arquivo (GPX/TCX)":
-            arquivo_treino = st.file_uploader(
-                "Arquivo do treino (.gpx ou .tcx)", type=["gpx", "tcx"], key="upload_treino_corrida",
-            )
-            if arquivo_treino is not None:
+        if sincronizar_clicado:
+            if not url_ical.strip():
+                st.error("Informe a URL do calendário iCal.")
+            else:
                 try:
-                    extensao = arquivo_treino.name.split(".")[-1].lower()
-                    resultado = processar_arquivo_gpx(arquivo_treino) if extensao == "gpx" else processar_arquivo_tcx(arquivo_treino)
-                    pace_calculado = (
-                        resultado["tempo_min"] / resultado["distancia_km"] if resultado["distancia_km"] > 0 else None
+                    with st.spinner("Sincronizando calendário..."):
+                        resumo_sync = sincronizar_calendario_completo(url_ical, hoje=hoje)
+                    st.success(
+                        f"Sincronização concluída — Realizados: {resumo_sync['realizado']} · "
+                        f"Planejados: {resumo_sync['planejado']} · Dias sem evento: {resumo_sync['sem_evento']}"
                     )
-
-                    pc1, pc2, pc3 = st.columns(3)
-                    pc1.metric("Distância real", f"{resultado['distancia_km']} km")
-                    pc2.metric("Tempo gasto", f"{resultado['tempo_min']} min")
-                    pc3.metric("Pace médio", formatar_pace(pace_calculado))
-
-                    resumo_laps = formatar_resumo_laps(resultado["laps"])
-                    if resumo_laps:
-                        st.markdown(
-                            f"""
-                            <div class="fh-card">
-                                <h4>Resumo dos laps / tiros</h4>
-                                <p style="white-space:pre-wrap;">{html.escape(resumo_laps)}</p>
-                            </div>
-                            """,
-                            unsafe_allow_html=True,
-                        )
-
-                    if st.button("Salvar treino importado", use_container_width=True, key="btn_salvar_arquivo_corrida"):
-                        pace = salvar_realizado_corrida(
-                            data_selecionada, resultado["distancia_km"], resultado["tempo_min"],
-                            comentarios="", laps_texto=resumo_laps, fonte=f"Arquivo {extensao.upper()}",
-                        )
-                        st.success(f"Treino importado e salvo. Pace: {formatar_pace(pace)}")
-                        st.rerun()
+                    st.rerun()
                 except Exception as erro:
-                    st.error(f"Não foi possível ler o arquivo: {erro}")
-        else:
-            with st.form("form_realizado_corrida_manual", clear_on_submit=True):
-                col1, col2 = st.columns(2)
-                dist_r = col1.number_input("Distância realizada (km)", min_value=0.0, step=0.1, value=0.0, key="dr")
-                tempo_r = col2.number_input("Tempo realizado (min)", min_value=0.0, step=1.0, value=0.0, key="tr")
-                comentarios_r = st.text_area(
-                    "Descrição das parciais / comentários",
-                    placeholder="Ex: tiros de 400m, sensação de cansaço, terreno com aclive...",
-                    key="comentarios_corrida",
-                )
-                enviado_r = st.form_submit_button("Registrar corrida", use_container_width=True)
-                if enviado_r:
-                    if dist_r <= 0:
-                        st.error("Informe uma distância maior que zero.")
-                    else:
-                        pace = salvar_realizado_corrida(
-                            data_selecionada, dist_r, tempo_r, comentarios=comentarios_r,
-                            laps_texto="", fonte="Registro manual",
-                        )
-                        st.success(f"Corrida registrada. Pace calculado: {formatar_pace(pace)}")
-                        st.rerun()
+                    st.error(f"Não foi possível sincronizar o calendário: {erro}")
 
         st.markdown("---")
-        titulo_secao("Comparativo do dia", subtitulo="Treino planejado e executado, lado a lado, com diferença exata.")
-        registro_corrida_dia = df_corrida[df_corrida["data"] == data_selecionada]
 
-        if registro_corrida_dia.empty:
-            st.info("Nenhum dado de corrida para esta data.")
+        # ------------------------------------------------------------------
+        # CARD DE STATUS DO DIA SELECIONADO
+        # ------------------------------------------------------------------
+        df_corrida = st.session_state["corrida"]  # recarrega em caso de sync acima
+        linha_dia_df = df_corrida[df_corrida["data"] == data_selecionada]
+
+        if linha_dia_df.empty:
+            status_dia, tom_status = "Sem dados para esta data", "warn"
         else:
-            linha = registro_corrida_dia.iloc[0]
-            dist_p_v, tempo_p_v = linha.get("distancia_prescrita_km"), linha.get("tempo_prescrito_min")
-            dist_r_v, tempo_r_v, pace_v = linha.get("distancia_real_km"), linha.get("tempo_real_min"), linha.get("pace_real")
+            linha_dia = linha_dia_df.iloc[0]
+            tem_planejado = pd.notna(linha_dia.get("distancia_prescrita_km"))
+            tem_realizado = pd.notna(linha_dia.get("distancia_real_km"))
+            if data_selecionada >= hoje:
+                status_dia = "Planejado (futuro)" if tem_planejado else "Sem treino planejado"
+                tom_status = "blue" if tem_planejado else "warn"
+            elif tem_realizado:
+                status_dia = "Realizado registrado"
+                tom_status = "accent"
+            elif tem_planejado:
+                status_dia = "Planejado, ainda não realizado"
+                tom_status = "warn"
+            else:
+                status_dia = "Sem dados para esta data"
+                tom_status = "warn"
 
-            col_plan, col_exec = st.columns(2)
-            with col_plan:
-                st.markdown("**Treino Planejado**")
-                st.write(f"Distância: {dist_p_v if pd.notna(dist_p_v) else '—'} km")
-                st.write(f"Tempo: {tempo_p_v if pd.notna(tempo_p_v) else '—'} min")
-                descricao_p_v = linha.get("descricao_planejada", "")
-                if isinstance(descricao_p_v, str) and descricao_p_v.strip():
-                    st.caption(descricao_p_v.strip())
+        csd1, csd2 = st.columns(2)
+        with csd1:
+            cartao_kpi("Data selecionada", data_selecionada.strftime("%d/%m/%Y"), "blue")
+        with csd2:
+            cartao_kpi("Status do dia", status_dia, tom_status)
 
-            with col_exec:
-                st.markdown("**Treino Executado**")
-                st.write(f"Distância: {dist_r_v if pd.notna(dist_r_v) else '—'} km")
-                st.write(f"Tempo: {tempo_r_v if pd.notna(tempo_r_v) else '—'} min")
-                st.write(f"Pace: {formatar_pace(pace_v) if pd.notna(pace_v) else '—'}")
-                fonte_v = linha.get("fonte_realizado", "")
-                if isinstance(fonte_v, str) and fonte_v.strip():
-                    st.caption(f"Fonte: {fonte_v}")
+        st.markdown("---")
 
-            tabela_diferenca = pd.DataFrame([
-                {
-                    "Métrica": "Distância (km)",
-                    "Planejado": dist_p_v if pd.notna(dist_p_v) else "—",
-                    "Realizado": dist_r_v if pd.notna(dist_r_v) else "—",
-                    "Diferença": (dist_r_v - dist_p_v) if pd.notna(dist_r_v) and pd.notna(dist_p_v) else "—",
-                },
-                {
-                    "Métrica": "Tempo (min)",
-                    "Planejado": tempo_p_v if pd.notna(tempo_p_v) else "—",
-                    "Realizado": tempo_r_v if pd.notna(tempo_r_v) else "—",
-                    "Diferença": (tempo_r_v - tempo_p_v) if pd.notna(tempo_r_v) and pd.notna(tempo_p_v) else "—",
-                },
-            ])
-            st.dataframe(tabela_diferenca, use_container_width=True, hide_index=True)
+        # ------------------------------------------------------------------
+        # ÚNICO EXPANDER: EDITAR REGISTRO MANUALMENTE (fallback do iCal)
+        # ------------------------------------------------------------------
+        with st.expander("Editar registro manualmente"):
+            st.caption("Use apenas para corrigir a data selecionada caso o iCal falhe ou venha incompleto.")
+            valores_atuais = linha_dia_df.iloc[0] if not linha_dia_df.empty else {}
 
-            comentario_txt = linha.get("comentarios", "")
-            if isinstance(comentario_txt, str) and comentario_txt.strip():
-                st.markdown(
-                    f"""
-                    <div class="fh-card" style="margin-top:0.8rem;">
-                        <h4>Comentários</h4>
-                        <p style="white-space:pre-wrap;">{html.escape(comentario_txt.strip())}</p>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
+            col_edit_p, col_edit_r = st.columns(2)
+            with col_edit_p:
+                with st.form("form_editar_planejado", clear_on_submit=False):
+                    st.markdown("**Planejado**")
+                    dist_p_edit = st.number_input(
+                        "Distância meta (km)", min_value=0.0, step=0.1,
+                        value=float(valores_atuais.get("distancia_prescrita_km", 0.0) or 0.0),
+                    )
+                    tempo_p_edit = st.number_input(
+                        "Tempo meta (min)", min_value=0.0, step=1.0,
+                        value=float(valores_atuais.get("tempo_prescrito_min", 0.0) or 0.0),
+                    )
+                    descricao_p_edit = st.text_area(
+                        "Descrição do treino planejado",
+                        value=str(valores_atuais.get("descricao_planejada", "") or ""),
+                    )
+                    if st.form_submit_button("Salvar planejado", use_container_width=True):
+                        salvar_prescricao_corrida(
+                            data_selecionada, dist_p_edit, tempo_p_edit, descricao_p_edit, fonte="Manual",
+                        )
+                        st.success("Treino planejado atualizado.")
+                        st.rerun()
 
-            laps_txt = linha.get("laps_realizados", "")
-            if isinstance(laps_txt, str) and laps_txt.strip():
-                st.markdown(
-                    f"""
-                    <div class="fh-card">
-                        <h4>Laps / Tiros registrados</h4>
-                        <p style="white-space:pre-wrap;">{html.escape(laps_txt.strip())}</p>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
+            with col_edit_r:
+                with st.form("form_editar_realizado", clear_on_submit=False):
+                    st.markdown("**Realizado**")
+                    dist_r_edit = st.number_input(
+                        "Distância realizada (km)", min_value=0.0, step=0.1,
+                        value=float(valores_atuais.get("distancia_real_km", 0.0) or 0.0),
+                    )
+                    tempo_r_edit = st.number_input(
+                        "Tempo realizado (min)", min_value=0.0, step=1.0,
+                        value=float(valores_atuais.get("tempo_real_min", 0.0) or 0.0),
+                    )
+                    comentarios_r_edit = st.text_area(
+                        "Comentários", value=str(valores_atuais.get("comentarios", "") or ""),
+                    )
+                    if st.form_submit_button("Salvar realizado", use_container_width=True):
+                        if dist_r_edit <= 0:
+                            st.error("Informe uma distância maior que zero.")
+                        else:
+                            pace = salvar_realizado_corrida(
+                                data_selecionada, dist_r_edit, tempo_r_edit,
+                                comentarios=comentarios_r_edit, laps_texto="", fonte="Manual",
+                            )
+                            st.success(f"Treino realizado atualizado. Pace: {formatar_pace(pace)}")
+                            st.rerun()
+
+        st.markdown("---")
+
+        # ------------------------------------------------------------------
+        # COMPARATIVO AUTOMÁTICO DO PERÍODO (DATA_CORTE_REALIZADO ATÉ HOJE)
+        # ------------------------------------------------------------------
+        titulo_secao(
+            "Comparativo do período", tag=f"Desde {DATA_CORTE_REALIZADO.strftime('%d/%m')}",
+            subtitulo="Todos os treinos entre a data de corte e hoje, planejado x realizado, lado a lado.",
+        )
+
+        periodo_df = df_corrida[
+            (df_corrida["data"] >= DATA_CORTE_REALIZADO) & (df_corrida["data"] <= hoje)
+        ].copy()
+
+        if periodo_df.empty:
+            st.info("Nenhum treino sincronizado ainda para o período. Clique em 'Sincronizar Calendário' acima.")
+        else:
+            periodo_df = periodo_df.sort_values("data")
+
+            km_planejados = periodo_df["distancia_prescrita_km"].dropna().sum()
+            km_realizados = periodo_df["distancia_real_km"].dropna().sum()
+            diferenca_total_km = km_realizados - km_planejados
+            dias_com_meta = periodo_df["distancia_prescrita_km"].notna().sum()
+            dias_cumpridos = (
+                periodo_df["distancia_prescrita_km"].notna() & periodo_df["distancia_real_km"].notna()
+            ).sum()
+            adesao_periodo = (dias_cumpridos / dias_com_meta * 100) if dias_com_meta > 0 else 0
+
+            r1, r2, r3, r4 = st.columns(4)
+            with r1:
+                cartao_kpi("Km planejados", f"{km_planejados} km", "blue")
+            with r2:
+                cartao_kpi("Km realizados", f"{km_realizados} km", "accent")
+            with r3:
+                cartao_kpi("Diferença total", f"{diferenca_total_km} km", "warn")
+            with r4:
+                cartao_kpi("Adesão no período", f"{adesao_periodo}%", "accent")
+
+            def status_diferenca_linha(linha):
+                """Resume a diferença exata (km) ou o status quando falta um dos dois lados."""
+                dist_p = linha.get("distancia_prescrita_km")
+                dist_r = linha.get("distancia_real_km")
+                if pd.notna(dist_r) and pd.notna(dist_p):
+                    diff = dist_r - dist_p
+                    sinal = "+" if diff >= 0 else ""
+                    return f"{sinal}{diff} km"
+                if pd.notna(dist_r) and pd.isna(dist_p):
+                    return "Realizado (sem meta)"
+                if pd.isna(dist_r) and pd.notna(dist_p):
+                    return "Não realizado"
+                return "Sem dados"
+
+            tabela_periodo = pd.DataFrame({
+                "Data": periodo_df["data"].apply(lambda d: d.strftime("%d/%m/%Y")),
+                "Distância Planejada (km)": periodo_df["distancia_prescrita_km"].apply(lambda v: v if pd.notna(v) else "—"),
+                "Distância Realizada (km)": periodo_df["distancia_real_km"].apply(lambda v: v if pd.notna(v) else "—"),
+                "Tempo Planejado (min)": periodo_df["tempo_prescrito_min"].apply(lambda v: v if pd.notna(v) else "—"),
+                "Tempo Realizado (min)": periodo_df["tempo_real_min"].apply(lambda v: v if pd.notna(v) else "—"),
+                "Status / Diferença": periodo_df.apply(status_diferenca_linha, axis=1),
+            }).sort_values("Data", ascending=False)
+
+            st.dataframe(tabela_periodo, use_container_width=True, hide_index=True)
 
     # ------------------------------------------------------------------
     # SUB-ABA DIETA
