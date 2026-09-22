@@ -1,14 +1,19 @@
 """
-Follow Here — Diário de Treinos de Corrida (Integração Runna / Google Calendar)
-=================================================================================
+Follow Here — App de Treinos (Corrida / Musculação / Alimentação)
+=====================================================================
+Navegação principal pela barra lateral (menu). A seção Corrida sincroniza
+o iCal do Runna (Google Calendar) automaticamente em segundo plano, sem
+inputs do usuário, e mantém uma base persistente (CSV) que preserva a
+META (prescrito) mesmo depois que o Runna substitui o evento pelo resumo
+REALIZADO.
+
 Fluxo de persistência progressiva:
-  - Evento PLANEJADO no iCal -> grava/atualiza apenas os campos de META (prescrito)
-    na base persistente (CSV), para a data do evento.
-  - Evento REALIZADO no iCal (o Runna SUBSTITUI o evento planejado pelo resumo
-    assim que o treino é sincronizado do Strava/Garmin) -> grava/atualiza apenas
-    os campos REAIS na mesma linha daquela data, sem apagar a meta já gravada.
-  - Isso garante que, mesmo o Google Calendar não exibindo mais o planejado
-    depois que o treino é concluído, o app nunca perde o dado de prescrição.
+  - Evento PLANEJADO no iCal -> grava/atualiza os campos de META (prescrito).
+  - Evento REALIZADO no iCal -> grava/atualiza os campos REAIS, sem apagar
+    a meta já gravada.
+  - Edições manuais marcam a linha como "manual" para aquele lado
+    (prescrito/real), impedindo que a sincronização automática subsequente
+    sobrescreva o que foi ajustado à mão.
 """
 
 import os
@@ -31,18 +36,19 @@ NOME_PROVA = "Meia Maratona"
 TOLERANCIA_DISTANCIA_PCT = 0.10   # 10% de tolerância na distância
 TOLERANCIA_PACE_PCT = 0.05        # 5% de tolerância no pace
 
-# Caminho do "banco de dados" persistente (CSV). Em deploy na nuvem, troque
-# por um disco persistente ou por SQLite/Google Sheets conforme sua infra.
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "treinos_db.csv")
+INTERVALO_MIN_SYNC_SEGUNDOS = 300  # não sincroniza mais que 1x a cada 5 min
 
-COLUNAS_BASE = [
+# Caminho do "banco de dados" persistente (CSV) para a Corrida.
+DB_PATH_CORRIDA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "treinos_corrida_db.csv")
+
+COLUNAS_BASE_CORRIDA = [
     "data", "nome_treino",
     "distancia_prescrita_km", "tempo_prescrito_min", "pace_prescrito_min_km",
     "distancia_real_km", "tempo_real_min", "pace_real_min_km",
-    "status",
+    "status", "prescricao_manual", "realizado_manual",
 ]
 
-st.set_page_config(page_title="Follow Here — Corrida", layout="wide", page_icon="🏃")
+st.set_page_config(page_title="Follow Here", layout="wide", page_icon="🏃")
 
 
 # ============================================================
@@ -94,7 +100,7 @@ def formatar_pace(pace_min_km) -> str:
 # REGEX - PADRÕES DE PARSING DO RUNNA
 # ============================================================
 
-# --- EVENTO PLANEJADO (prescrição, treino futuro / ainda não sincronizado) ---
+# --- EVENTO PLANEJADO (prescrição) ---
 # Descrição típica: "Treino de ritmo • 5,5km • 35m - 40m\n2km de aquecimento..."
 REGEX_PRESCRICAO_FAIXA = re.compile(
     r"(?P<nome>[^•\n]+?)\s*•\s*(?P<distancia>[\d.,]+)\s*km\s*•\s*"
@@ -113,17 +119,11 @@ REGEX_REAL_DISTANCIA = re.compile(r"Dist[âa]ncia:\s*([\d.,]+)\s*km", re.IGNOREC
 REGEX_REAL_TEMPO = re.compile(r"Hor[áa]rio:\s*(\d+):(\d{2})", re.IGNORECASE)
 REGEX_REAL_PACE = re.compile(r"Ritmo\s*m[ée]dio:\s*(\d+):(\d{2})\s*/\s*km", re.IGNORECASE)
 
-# Marcador que identifica que a descrição é um "resumo de execução" (contém "Resumo:")
 MARCADOR_REALIZADO = re.compile(r"(Resumo|Dist[âa]ncia:|Hor[áa]rio:)", re.IGNORECASE)
 
 
 def eh_evento_realizado(descricao: str) -> bool:
-    """
-    Detecta se a descrição corresponde a um treino REALIZADO.
-    Regra: o Runna, sem integração direta ao Strava, SUBSTITUI o evento
-    planejado pelo resumo assim que o treino é concluído — então a presença
-    de "Resumo:"/"Distância:"/"Horário:" é o sinal decisivo.
-    """
+    """Detecta se a descrição corresponde a um treino REALIZADO (resumo Strava/Garmin)."""
     if not descricao:
         return False
     return bool(MARCADOR_REALIZADO.search(descricao)) and bool(REGEX_REAL_DISTANCIA.search(descricao))
@@ -184,15 +184,22 @@ def extrair_realizado(titulo: str, descricao: str):
 def classificar_status(linha) -> str:
     """
     Compara prescrito x real e retorna um status textual.
-    Ajuste TOLERANCIA_DISTANCIA_PCT / TOLERANCIA_PACE_PCT conforme necessário.
+    - "Sem Registro": nem meta nem realizado.
+    - "Planejado": tem meta, ainda sem realizado (treino futuro ou pendente).
+    - "Sem Meta": realizado sem prescrição correspondente.
+    - "Dentro do Alvo" / "Abaixo do Alvo" / "Superado": comparação com tolerância.
     """
     d_plan = linha.get("distancia_prescrita_km")
     d_real = linha.get("distancia_real_km")
     p_plan = linha.get("pace_prescrito_min_km")
     p_real = linha.get("pace_real_min_km")
 
-    if pd.isna(d_plan) or pd.isna(d_real):
+    if pd.isna(d_plan) and pd.isna(d_real):
         return "Sem Registro"
+    if pd.isna(d_real):
+        return "Planejado"
+    if pd.isna(d_plan):
+        return "Sem Meta"
 
     delta_dist_pct = (d_real - d_plan) / d_plan if d_plan else 0
 
@@ -210,37 +217,40 @@ def classificar_status(linha) -> str:
 # ============================================================
 # BASE PERSISTENTE (CSV) — GRAVAÇÃO PROGRESSIVA
 # ============================================================
-def carregar_base() -> pd.DataFrame:
+def carregar_base_corrida() -> pd.DataFrame:
     """Carrega a base persistente do disco (ou cria uma vazia se ainda não existir)."""
-    if os.path.exists(DB_PATH):
-        df = pd.read_csv(DB_PATH)
+    if os.path.exists(DB_PATH_CORRIDA):
+        df = pd.read_csv(DB_PATH_CORRIDA)
         df["data"] = pd.to_datetime(df["data"]).dt.date
-        for coluna in COLUNAS_BASE:
+        for coluna in COLUNAS_BASE_CORRIDA:
             if coluna not in df.columns:
-                df[coluna] = None
-        return df[COLUNAS_BASE]
-    return pd.DataFrame(columns=COLUNAS_BASE)
+                df[coluna] = False if coluna.endswith("_manual") else None
+        df["prescricao_manual"] = df["prescricao_manual"].fillna(False).astype(bool)
+        df["realizado_manual"] = df["realizado_manual"].fillna(False).astype(bool)
+        return df[COLUNAS_BASE_CORRIDA]
+    return pd.DataFrame(columns=COLUNAS_BASE_CORRIDA)
 
 
-def salvar_base(df: pd.DataFrame) -> None:
+def salvar_base_corrida(df: pd.DataFrame) -> None:
     """Persiste a base no disco em CSV."""
-    df.to_csv(DB_PATH, index=False)
+    df.to_csv(DB_PATH_CORRIDA, index=False)
 
 
-def upsert_linha(df_base: pd.DataFrame, data_evento: date, tipo: str, dados: dict) -> pd.DataFrame:
+def upsert_linha_corrida(df_base: pd.DataFrame, data_evento: date, tipo: str, dados: dict, origem: str) -> pd.DataFrame:
     """
     Insere ou atualiza a linha de `data_evento` na base persistente.
 
-    - tipo == "prescricao": grava apenas os campos de META, sem tocar nos campos REAIS
-      já existentes.
-    - tipo == "realizado": grava apenas os campos REAIS, sem apagar a META já gravada
-      anteriormente (é exatamente isso que evita perder o planejado quando o Runna
-      substitui o evento pelo resumo).
+    tipo: "prescricao" ou "realizado" — qual lado dos dados está sendo gravado.
+    origem: "ical" (sincronização automática) ou "manual" (edição do usuário).
+
+    Regra chave: se o lado (prescrito/realizado) já foi marcado como editado
+    manualmente, a sincronização automática do iCal NÃO sobrescreve esse lado
+    — evita que o auto-sync em segundo plano apague um ajuste manual.
     """
     idx_existente = df_base.index[df_base["data"] == data_evento]
 
     if len(idx_existente) == 0:
-        nova_linha = {coluna: None for coluna in COLUNAS_BASE}
+        nova_linha = {coluna: (False if coluna.endswith("_manual") else None) for coluna in COLUNAS_BASE_CORRIDA}
         nova_linha["data"] = data_evento
         df_base = pd.concat([df_base, pd.DataFrame([nova_linha])], ignore_index=True)
         idx = df_base.index[df_base["data"] == data_evento][0]
@@ -248,18 +258,25 @@ def upsert_linha(df_base: pd.DataFrame, data_evento: date, tipo: str, dados: dic
         idx = idx_existente[0]
 
     if tipo == "prescricao":
-        df_base.at[idx, "nome_treino"] = dados["nome_treino"]
+        if origem == "ical" and bool(df_base.at[idx, "prescricao_manual"]):
+            return df_base  # respeita o ajuste manual, ignora o valor vindo do iCal
+        df_base.at[idx, "nome_treino"] = dados["nome_treino"] or df_base.at[idx, "nome_treino"]
         df_base.at[idx, "distancia_prescrita_km"] = dados["distancia_prescrita_km"]
         df_base.at[idx, "tempo_prescrito_min"] = dados["tempo_prescrito_min"]
         df_base.at[idx, "pace_prescrito_min_km"] = dados["pace_prescrito_min_km"]
+        if origem == "manual":
+            df_base.at[idx, "prescricao_manual"] = True
     else:  # "realizado"
-        # Só usa o nome do resumo se ainda não existir um nome de prescrição salvo.
+        if origem == "ical" and bool(df_base.at[idx, "realizado_manual"]):
+            return df_base  # respeita o ajuste manual, ignora o valor vindo do iCal
         nome_atual = df_base.at[idx, "nome_treino"]
         if pd.isna(nome_atual) or not str(nome_atual).strip():
             df_base.at[idx, "nome_treino"] = dados["nome_treino"]
         df_base.at[idx, "distancia_real_km"] = dados["distancia_real_km"]
         df_base.at[idx, "tempo_real_min"] = dados["tempo_real_min"]
         df_base.at[idx, "pace_real_min_km"] = dados["pace_real_min_km"]
+        if origem == "manual":
+            df_base.at[idx, "realizado_manual"] = True
 
     df_base.at[idx, "status"] = classificar_status(df_base.loc[idx])
     return df_base
@@ -268,22 +285,36 @@ def upsert_linha(df_base: pd.DataFrame, data_evento: date, tipo: str, dados: dic
 # ============================================================
 # DOWNLOAD E SINCRONIZAÇÃO DO ICAL -> BASE PERSISTENTE
 # ============================================================
-@st.cache_data(ttl=600, show_spinner=False)
+def obter_url_ical() -> str:
+    """
+    Busca a URL do iCal do Runna a partir de st.secrets (configuração do app),
+    já que a sincronização agora é 100% automática, sem input do usuário.
+    Configure em .streamlit/secrets.toml:
+        ICAL_URL_RUNNA = "https://calendar.google.com/calendar/ical/.../basic.ics"
+    """
+    try:
+        return st.secrets.get("ICAL_URL_RUNNA", "")
+    except Exception:
+        return ""
+
+
+@st.cache_data(ttl=INTERVALO_MIN_SYNC_SEGUNDOS, show_spinner=False)
 def baixar_ical(url: str) -> bytes:
-    """Baixa o conteúdo do iCal a partir da URL pública do Google Calendar (Runna)."""
+    """Baixa o conteúdo do iCal a partir da URL do Google Calendar (Runna)."""
     resposta = requests.get(url, timeout=20)
     resposta.raise_for_status()
     return resposta.content
 
 
-def sincronizar_calendario(url: str, data_inicio: date) -> pd.DataFrame:
+def sincronizar_calendario(url: str, data_inicio: date, data_fim: date) -> pd.DataFrame:
     """
     Baixa o iCal, classifica cada evento (prescrição ou realizado) e grava
-    progressivamente na base persistente, preservando os dados já existentes.
+    progressivamente na base persistente, do passado (realizado) ao futuro
+    planejado (até `data_fim`), preservando ajustes manuais já feitos.
     """
     conteudo = baixar_ical(url)
     calendario = Calendar.from_ical(conteudo)
-    df_base = carregar_base()
+    df_base = carregar_base_corrida()
 
     for componente in calendario.walk():
         if componente.name != "VEVENT":
@@ -297,7 +328,7 @@ def sincronizar_calendario(url: str, data_inicio: date) -> pd.DataFrame:
         if isinstance(data_evento, datetime):
             data_evento = data_evento.date()
 
-        if data_evento < data_inicio or data_evento > date.today():
+        if data_evento < data_inicio or data_evento > data_fim:
             continue
 
         titulo = str(componente.get("summary", ""))
@@ -306,68 +337,90 @@ def sincronizar_calendario(url: str, data_inicio: date) -> pd.DataFrame:
         if eh_evento_realizado(descricao):
             dados = extrair_realizado(titulo, descricao)
             if dados:
-                df_base = upsert_linha(df_base, data_evento, "realizado", dados)
+                df_base = upsert_linha_corrida(df_base, data_evento, "realizado", dados, origem="ical")
         else:
             dados = extrair_prescricao(titulo, descricao)
             if dados:
-                df_base = upsert_linha(df_base, data_evento, "prescricao", dados)
+                df_base = upsert_linha_corrida(df_base, data_evento, "prescricao", dados, origem="ical")
 
     df_base = df_base.sort_values("data").reset_index(drop=True)
-    salvar_base(df_base)
+    salvar_base_corrida(df_base)
     return df_base
 
 
-def salvar_edicao_manual(data_evento: date, campos_prescritos: dict, campos_reais: dict) -> pd.DataFrame:
-    """Aplica um ajuste manual diretamente na base persistente e recalcula pace/status."""
-    df_base = carregar_base()
+def salvar_edicao_manual_corrida(data_evento: date, campos_prescritos: dict, campos_reais: dict) -> pd.DataFrame:
+    """Aplica um ajuste manual na base persistente e marca o lado editado como 'manual'."""
+    df_base = carregar_base_corrida()
 
     if campos_prescritos:
-        df_base = upsert_linha(df_base, data_evento, "prescricao", {
+        df_base = upsert_linha_corrida(df_base, data_evento, "prescricao", {
             "nome_treino": campos_prescritos.get("nome_treino") or "Treino",
             "distancia_prescrita_km": campos_prescritos["distancia_prescrita_km"],
             "tempo_prescrito_min": campos_prescritos["tempo_prescrito_min"],
             "pace_prescrito_min_km": calcular_pace_min_km(
                 campos_prescritos["tempo_prescrito_min"], campos_prescritos["distancia_prescrita_km"]
             ),
-        })
+        }, origem="manual")
     if campos_reais:
-        df_base = upsert_linha(df_base, data_evento, "realizado", {
+        df_base = upsert_linha_corrida(df_base, data_evento, "realizado", {
             "nome_treino": campos_reais.get("nome_treino") or "Treino realizado",
             "distancia_real_km": campos_reais["distancia_real_km"],
             "tempo_real_min": campos_reais["tempo_real_min"],
             "pace_real_min_km": calcular_pace_min_km(
                 campos_reais["tempo_real_min"], campos_reais["distancia_real_km"]
             ),
-        })
+        }, origem="manual")
 
     df_base = df_base.sort_values("data").reset_index(drop=True)
-    salvar_base(df_base)
+    salvar_base_corrida(df_base)
     return df_base
 
 
+def sincronizar_em_segundo_plano() -> None:
+    """
+    Sincroniza automaticamente em segundo plano, no máximo a cada
+    INTERVALO_MIN_SYNC_SEGUNDOS, sem qualquer input do usuário.
+    """
+    url = obter_url_ical()
+    if not url:
+        st.session_state.status_sync = "sem_url"
+        return
+
+    agora = datetime.now()
+    ultima = st.session_state.get("ultima_sincronizacao")
+    if ultima is not None and (agora - ultima).total_seconds() < INTERVALO_MIN_SYNC_SEGUNDOS:
+        return
+
+    try:
+        df = sincronizar_calendario(url, DATA_INICIO_PLANO, DATA_PROVA)
+        st.session_state.df_treinos = df
+        st.session_state.ultima_sincronizacao = agora
+        st.session_state.status_sync = "ok"
+    except Exception as e:
+        st.session_state.status_sync = f"erro: {e}"
+
+
 # ============================================================
-# BANNER DE CONTAGEM REGRESSIVA
+# BANNER DE CONTAGEM REGRESSIVA (BARRA LATERAL)
 # ============================================================
-def renderizar_banner_contagem(data_prova: date, nome_prova: str) -> None:
+def renderizar_banner_contagem_sidebar(data_prova: date, nome_prova: str) -> None:
     dias_restantes = (data_prova - date.today()).days
     if dias_restantes > 0:
         texto_dias = f"Faltam {dias_restantes} dias"
     elif dias_restantes == 0:
         texto_dias = "É hoje! 🎉"
     else:
-        texto_dias = f"Prova realizada há {abs(dias_restantes)} dias"
+        texto_dias = f"Prova há {abs(dias_restantes)} dias"
 
-    st.markdown(
+    st.sidebar.markdown(
         f"""
         <div style="
-            background: linear-gradient(90deg, #FF4B4B, #FF8C42);
-            padding: 14px 22px; border-radius: 12px; color: white;
-            display: flex; justify-content: space-between; align-items: center;
-            margin-bottom: 18px;">
-            <div>
-                <div style="font-size: 0.9rem; opacity: 0.9;">🏁 {nome_prova} — {data_prova.strftime('%d/%m/%Y')}</div>
-                <div style="font-size: 1.5rem; font-weight: 700;">{texto_dias}</div>
-            </div>
+            background: linear-gradient(135deg, #FF4B4B, #FF8C42);
+            padding: 12px 14px; border-radius: 12px; color: white;
+            margin-bottom: 14px; text-align: center;">
+            <div style="font-size: 0.75rem; opacity: 0.9;">🏁 {nome_prova}</div>
+            <div style="font-size: 1.3rem; font-weight: 700; line-height: 1.2;">{texto_dias}</div>
+            <div style="font-size: 0.7rem; opacity: 0.85;">{data_prova.strftime('%d/%m/%Y')}</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -378,187 +431,212 @@ def renderizar_banner_contagem(data_prova: date, nome_prova: str) -> None:
 # ESTADO DA SESSÃO
 # ============================================================
 if "df_treinos" not in st.session_state:
-    st.session_state.df_treinos = carregar_base()
-if "url_ical" not in st.session_state:
-    st.session_state.url_ical = ""
+    st.session_state.df_treinos = carregar_base_corrida()
+if "ultima_sincronizacao" not in st.session_state:
+    st.session_state.ultima_sincronizacao = None
+if "status_sync" not in st.session_state:
+    st.session_state.status_sync = None
 
-
-# ============================================================
-# SIDEBAR — SINCRONIZAÇÃO
-# ============================================================
-with st.sidebar:
-    st.header("⚙️ Sincronização")
-    url_ical = st.text_input(
-        "URL do iCal (Google Calendar / Runna)",
-        value=st.session_state.url_ical,
-        placeholder="https://calendar.google.com/calendar/ical/.../basic.ics",
-    )
-    st.caption(f"Dados considerados a partir de **{DATA_INICIO_PLANO.strftime('%d/%m/%Y')}**")
-    st.caption(f"Base persistente: `{os.path.basename(DB_PATH)}`")
-
-    if st.button("🔄 Sincronizar Calendário", use_container_width=True, type="primary"):
-        if not url_ical:
-            st.error("Informe a URL do iCal antes de sincronizar.")
-        else:
-            with st.spinner("Baixando, classificando e gravando os treinos..."):
-                try:
-                    df = sincronizar_calendario(url_ical, DATA_INICIO_PLANO)
-                    st.session_state.df_treinos = df
-                    st.session_state.url_ical = url_ical
-                    st.success(f"{len(df)} dias sincronizados e gravados na base!")
-                except Exception as e:
-                    st.error(f"Erro ao sincronizar: {e}")
-
+# Sincronização automática, silenciosa, sem inputs do usuário.
+sincronizar_em_segundo_plano()
 df_treinos = st.session_state.df_treinos.copy()
 
 
 # ============================================================
-# LAYOUT PRINCIPAL
+# BARRA LATERAL — MENU DE NAVEGAÇÃO PRINCIPAL
 # ============================================================
-st.title("🏃 Follow Here — Diário de Treinos")
+renderizar_banner_contagem_sidebar(DATA_PROVA, NOME_PROVA)
 
-aba_diario, aba_evolucao = st.tabs(["📅 Diário do Dia", "📈 Evolução"])
+st.sidebar.markdown("### 📌 Navegação")
+pagina = st.sidebar.radio(
+    label="Ir para:",
+    options=["🏃‍♂️ Corrida", "🏋️‍♂️ Musculação", "🥗 Alimentação"],
+    label_visibility="collapsed",
+)
 
-# ------------------------------------------------------------
-# ABA 1: DIÁRIO DO DIA — sub-aba Corrida
-# ------------------------------------------------------------
-with aba_diario:
-    (sub_corrida,) = st.tabs(["🏃 Corrida"])
+with st.sidebar:
+    st.divider()
+    if st.session_state.status_sync == "ok" and st.session_state.ultima_sincronizacao:
+        st.caption(f"✅ Sincronizado às {st.session_state.ultima_sincronizacao.strftime('%H:%M')}")
+    elif st.session_state.status_sync == "sem_url":
+        st.caption("⚠️ Configure `ICAL_URL_RUNNA` em `st.secrets` para sincronizar automaticamente.")
+    elif isinstance(st.session_state.status_sync, str) and st.session_state.status_sync.startswith("erro"):
+        st.caption(f"⚠️ Falha na última sincronização: {st.session_state.status_sync}")
 
-    with sub_corrida:
-        renderizar_banner_contagem(DATA_PROVA, NOME_PROVA)
 
+# ============================================================
+# MÓDULO: CORRIDA
+# ============================================================
+def render_corrida(df_treinos: pd.DataFrame) -> None:
+    tela_panorama, tela_evolucao = st.tabs(["📋 Diário / Panorama", "📈 Evolução"])
+
+    # --------------------------------------------------------
+    # TELA: DIÁRIO / PANORAMA
+    # --------------------------------------------------------
+    with tela_panorama:
         if df_treinos.empty:
-            st.info("Nenhum dado sincronizado ainda. Clique em **Sincronizar Calendário** na barra lateral.")
-        else:
-            datas_disponiveis = sorted(df_treinos["data"].unique())
-            valor_padrao = date.today() if date.today() in datas_disponiveis else datas_disponiveis[-1]
+            st.info("Ainda não há treinos sincronizados. Assim que o iCal for configurado, os dados aparecem aqui automaticamente.")
+            return
 
-            data_selecionada = st.date_input(
-                "Data do registro",
-                value=valor_padrao,
-                min_value=DATA_INICIO_PLANO,
-                max_value=date.today(),
-            )
+        hoje = date.today()
+        st.subheader("📆 Panorama de Treinos")
 
-            linha_sel = df_treinos[df_treinos["data"] == data_selecionada]
+        proximos = df_treinos[df_treinos["data"] >= hoje].sort_values("data").head(7)
+        recentes = df_treinos[df_treinos["data"] < hoje].sort_values("data", ascending=False).head(7)
 
-            if linha_sel.empty:
-                st.warning("Nenhum treino registrado para esta data.")
-                treino = pd.Series({c: None for c in COLUNAS_BASE})
+        col_prox, col_rec = st.columns(2)
+        with col_prox:
+            st.markdown("**📅 Próximos treinos (planejado)**")
+            if proximos.empty:
+                st.caption("Nenhum treino planejado à frente até a prova.")
             else:
-                treino = linha_sel.iloc[0]
-
-                # --------- CARD DE CABEÇALHO ---------
-                st.subheader(f"🎯 {treino['nome_treino'] or 'Treino'}")
-                st.caption(
-                    f"{data_selecionada.strftime('%A, %d/%m/%Y')} — "
-                    f"Status: **{treino.get('status') or 'Sem Registro'}**"
+                st.dataframe(
+                    proximos[["data", "nome_treino", "distancia_prescrita_km", "status"]].rename(columns={
+                        "data": "Data", "nome_treino": "Treino",
+                        "distancia_prescrita_km": "Km Planejados", "status": "Status",
+                    }),
+                    hide_index=True, use_container_width=True,
+                )
+        with col_rec:
+            st.markdown("**✅ Últimos treinos (realizado)**")
+            if recentes.empty:
+                st.caption("Ainda não há treinos concluídos registrados.")
+            else:
+                st.dataframe(
+                    recentes[["data", "nome_treino", "distancia_real_km", "status"]].rename(columns={
+                        "data": "Data", "nome_treino": "Treino",
+                        "distancia_real_km": "Km Realizados", "status": "Status",
+                    }),
+                    hide_index=True, use_container_width=True,
                 )
 
-                # --------- COMPARATIVO LADO A LADO ---------
-                col1, col2, col3 = st.columns(3)
+        st.divider()
 
-                with col1:
-                    delta_dist = None
-                    if pd.notna(treino["distancia_prescrita_km"]) and pd.notna(treino["distancia_real_km"]):
-                        delta_dist = treino["distancia_real_km"] - treino["distancia_prescrita_km"]
-                    st.metric(
-                        "Distância (Real)",
-                        f"{treino['distancia_real_km']:.2f} km" if pd.notna(treino["distancia_real_km"]) else "-",
-                        delta=f"{delta_dist:+.2f} km" if delta_dist is not None else None,
-                        help=(
-                            f"Planejado: {treino['distancia_prescrita_km']:.2f} km"
-                            if pd.notna(treino["distancia_prescrita_km"]) else "Sem meta registrada para o dia"
-                        ),
+        # --------- COMPARATIVO DO DIA SELECIONADO ---------
+        datas_disponiveis = sorted(df_treinos["data"].unique())
+        valor_padrao = hoje if hoje in datas_disponiveis else datas_disponiveis[-1]
+
+        data_selecionada = st.date_input(
+            "Data do registro",
+            value=valor_padrao,
+            min_value=DATA_INICIO_PLANO,
+            max_value=DATA_PROVA,
+        )
+
+        linha_sel = df_treinos[df_treinos["data"] == data_selecionada]
+        if linha_sel.empty:
+            treino = pd.Series({c: None for c in COLUNAS_BASE_CORRIDA})
+            st.warning("Nenhum treino registrado para esta data.")
+        else:
+            treino = linha_sel.iloc[0]
+
+            st.subheader(f"🎯 {treino['nome_treino'] or 'Treino'}")
+            st.caption(
+                f"{data_selecionada.strftime('%A, %d/%m/%Y')} — "
+                f"Status: **{treino.get('status') or 'Sem Registro'}**"
+            )
+
+            col1, col2, col3 = st.columns(3)
+
+            with col1:
+                delta_dist = None
+                if pd.notna(treino["distancia_prescrita_km"]) and pd.notna(treino["distancia_real_km"]):
+                    delta_dist = treino["distancia_real_km"] - treino["distancia_prescrita_km"]
+                st.metric(
+                    "Distância (Real)",
+                    f"{treino['distancia_real_km']:.2f} km" if pd.notna(treino["distancia_real_km"]) else "-",
+                    delta=f"{delta_dist:+.2f} km" if delta_dist is not None else None,
+                    help=(
+                        f"Planejado: {treino['distancia_prescrita_km']:.2f} km"
+                        if pd.notna(treino["distancia_prescrita_km"]) else "Sem meta registrada para o dia"
+                    ),
+                )
+
+            with col2:
+                delta_tempo = None
+                if pd.notna(treino["tempo_prescrito_min"]) and pd.notna(treino["tempo_real_min"]):
+                    delta_tempo = treino["tempo_real_min"] - treino["tempo_prescrito_min"]
+                st.metric(
+                    "Tempo (Real)",
+                    minutos_para_mmss(treino["tempo_real_min"]),
+                    delta=f"{delta_tempo:+.1f} min" if delta_tempo is not None else None,
+                    delta_color="inverse",
+                    help=f"Planejado: {minutos_para_mmss(treino['tempo_prescrito_min'])}",
+                )
+
+            with col3:
+                delta_pace = None
+                if pd.notna(treino["pace_prescrito_min_km"]) and pd.notna(treino["pace_real_min_km"]):
+                    delta_pace = treino["pace_real_min_km"] - treino["pace_prescrito_min_km"]
+                st.metric(
+                    "Pace (Real)",
+                    formatar_pace(treino["pace_real_min_km"]),
+                    delta=f"{delta_pace:+.2f} min/km" if delta_pace is not None else None,
+                    delta_color="inverse",
+                    help=f"Planejado: {formatar_pace(treino['pace_prescrito_min_km'])}",
+                )
+
+            st.divider()
+
+        # --------- EDIÇÃO MANUAL (ÚNICO EXPANDER, DISCRETO) ---------
+        with st.expander("✏️ Editar registro manualmente"):
+            st.caption("Ajustes manuais ficam marcados e não são sobrescritos pela sincronização automática.")
+            with st.form(key=f"form_edicao_{data_selecionada}"):
+                st.markdown("**Meta (prescrito)**")
+                c1, c2 = st.columns(2)
+                nova_dist_prescrita = c1.number_input(
+                    "Distância prescrita (km)",
+                    value=float(treino["distancia_prescrita_km"]) if pd.notna(treino.get("distancia_prescrita_km")) else 0.0,
+                    step=0.01, format="%.2f",
+                )
+                novo_tempo_prescrito = c2.number_input(
+                    "Tempo prescrito (min, decimal)",
+                    value=float(treino["tempo_prescrito_min"]) if pd.notna(treino.get("tempo_prescrito_min")) else 0.0,
+                    step=0.1, format="%.2f",
+                )
+
+                st.markdown("**Realizado**")
+                c3, c4 = st.columns(2)
+                nova_dist_real = c3.number_input(
+                    "Distância realizada (km)",
+                    value=float(treino["distancia_real_km"]) if pd.notna(treino.get("distancia_real_km")) else 0.0,
+                    step=0.01, format="%.2f",
+                )
+                novo_tempo_real = c4.number_input(
+                    "Tempo realizado (min, decimal — ex.: 38:05 = 38.08)",
+                    value=float(treino["tempo_real_min"]) if pd.notna(treino.get("tempo_real_min")) else 0.0,
+                    step=0.1, format="%.2f",
+                )
+
+                salvar = st.form_submit_button("Salvar ajuste")
+                if salvar:
+                    campos_prescritos = (
+                        {
+                            "nome_treino": treino.get("nome_treino"),
+                            "distancia_prescrita_km": nova_dist_prescrita,
+                            "tempo_prescrito_min": novo_tempo_prescrito,
+                        } if nova_dist_prescrita > 0 or novo_tempo_prescrito > 0 else None
                     )
-
-                with col2:
-                    delta_tempo = None
-                    if pd.notna(treino["tempo_prescrito_min"]) and pd.notna(treino["tempo_real_min"]):
-                        delta_tempo = treino["tempo_real_min"] - treino["tempo_prescrito_min"]
-                    st.metric(
-                        "Tempo (Real)",
-                        minutos_para_mmss(treino["tempo_real_min"]),
-                        delta=f"{delta_tempo:+.1f} min" if delta_tempo is not None else None,
-                        delta_color="inverse",  # menos tempo do que o previsto = melhor
-                        help=f"Planejado: {minutos_para_mmss(treino['tempo_prescrito_min'])}",
+                    campos_reais = (
+                        {
+                            "nome_treino": treino.get("nome_treino"),
+                            "distancia_real_km": nova_dist_real,
+                            "tempo_real_min": novo_tempo_real,
+                        } if nova_dist_real > 0 or novo_tempo_real > 0 else None
                     )
+                    df_atualizado = salvar_edicao_manual_corrida(data_selecionada, campos_prescritos, campos_reais)
+                    st.session_state.df_treinos = df_atualizado
+                    st.success("Registro atualizado manualmente na base persistente.")
+                    st.rerun()
 
-                with col3:
-                    delta_pace = None
-                    if pd.notna(treino["pace_prescrito_min_km"]) and pd.notna(treino["pace_real_min_km"]):
-                        delta_pace = treino["pace_real_min_km"] - treino["pace_prescrito_min_km"]
-                    st.metric(
-                        "Pace (Real)",
-                        formatar_pace(treino["pace_real_min_km"]),
-                        delta=f"{delta_pace:+.2f} min/km" if delta_pace is not None else None,
-                        delta_color="inverse",  # pace menor do que o previsto = melhor
-                        help=f"Planejado: {formatar_pace(treino['pace_prescrito_min_km'])}",
-                    )
+    # --------------------------------------------------------
+    # TELA: EVOLUÇÃO
+    # --------------------------------------------------------
+    with tela_evolucao:
+        if df_treinos.empty:
+            st.info("Sem dados sincronizados ainda para exibir a evolução.")
+            return
 
-                st.divider()
-
-            # --------- EDIÇÃO MANUAL (ÚNICO EXPANDER, DISCRETO) ---------
-            with st.expander("✏️ Editar registro manualmente"):
-                st.caption("Os ajustes gravam direto na base persistente, sem apagar os demais dados do dia.")
-                with st.form(key=f"form_edicao_{data_selecionada}"):
-                    st.markdown("**Meta (prescrito)**")
-                    c1, c2 = st.columns(2)
-                    nova_dist_prescrita = c1.number_input(
-                        "Distância prescrita (km)",
-                        value=float(treino["distancia_prescrita_km"]) if pd.notna(treino.get("distancia_prescrita_km")) else 0.0,
-                        step=0.01, format="%.2f",
-                    )
-                    novo_tempo_prescrito = c2.number_input(
-                        "Tempo prescrito (min, decimal)",
-                        value=float(treino["tempo_prescrito_min"]) if pd.notna(treino.get("tempo_prescrito_min")) else 0.0,
-                        step=0.1, format="%.2f",
-                    )
-
-                    st.markdown("**Realizado**")
-                    c3, c4 = st.columns(2)
-                    nova_dist_real = c3.number_input(
-                        "Distância realizada (km)",
-                        value=float(treino["distancia_real_km"]) if pd.notna(treino.get("distancia_real_km")) else 0.0,
-                        step=0.01, format="%.2f",
-                    )
-                    novo_tempo_real = c4.number_input(
-                        "Tempo realizado (min, decimal — ex.: 38:05 = 38.08)",
-                        value=float(treino["tempo_real_min"]) if pd.notna(treino.get("tempo_real_min")) else 0.0,
-                        step=0.1, format="%.2f",
-                    )
-
-                    salvar = st.form_submit_button("Salvar ajuste")
-                    if salvar:
-                        campos_prescritos = (
-                            {
-                                "nome_treino": treino.get("nome_treino"),
-                                "distancia_prescrita_km": nova_dist_prescrita,
-                                "tempo_prescrito_min": novo_tempo_prescrito,
-                            }
-                            if nova_dist_prescrita > 0 or novo_tempo_prescrito > 0 else None
-                        )
-                        campos_reais = (
-                            {
-                                "nome_treino": treino.get("nome_treino"),
-                                "distancia_real_km": nova_dist_real,
-                                "tempo_real_min": novo_tempo_real,
-                            }
-                            if nova_dist_real > 0 or novo_tempo_real > 0 else None
-                        )
-                        df_atualizado = salvar_edicao_manual(data_selecionada, campos_prescritos, campos_reais)
-                        st.session_state.df_treinos = df_atualizado
-                        st.success("Registro atualizado manualmente na base persistente.")
-                        st.rerun()
-
-# ------------------------------------------------------------
-# ABA 2: EVOLUÇÃO — panorama geral do plano
-# ------------------------------------------------------------
-with aba_evolucao:
-    if df_treinos.empty:
-        st.info("Sincronize o calendário para visualizar a evolução do plano.")
-    else:
         st.subheader("📊 Panorama Geral do Plano")
 
         dist_total_real = df_treinos["distancia_real_km"].sum(skipna=True)
@@ -568,12 +646,12 @@ with aba_evolucao:
 
         k1, k2, k3 = st.columns(3)
         k1.metric(
-            "Distância Total Realizada",
+            "Km Acumulados vs. Total do Plano",
             f"{dist_total_real:.1f} km",
-            delta=f"{dist_total_real - dist_total_plan:+.1f} km vs {dist_total_plan:.1f} km planejados",
+            delta=f"{dist_total_real - dist_total_plan:+.1f} km vs {dist_total_plan:.1f} km do plano",
         )
         k2.metric("Horas Totais de Treino", f"{horas_total_real:.1f} h")
-        k3.metric("% de Cumprimento do Plano", f"{pct_cumprimento:.0f}%")
+        k3.metric("% do Plano Total Concluído", f"{pct_cumprimento:.0f}%")
 
         st.divider()
 
@@ -593,8 +671,7 @@ with aba_evolucao:
         fig_semanal.update_layout(
             barmode="group",
             title="Volume Semanal: Planejado vs Realizado",
-            xaxis_title="Semana",
-            yaxis_title="Km",
+            xaxis_title="Semana", yaxis_title="Km",
         )
         st.plotly_chart(fig_semanal, use_container_width=True)
 
@@ -613,10 +690,16 @@ with aba_evolucao:
             )
         fig_pace.update_layout(
             title="Evolução do Pace ao Longo do Tempo",
-            xaxis_title="Data",
-            yaxis_title="Pace (min/km)",
+            xaxis_title="Data", yaxis_title="Pace (min/km)",
         )
         st.plotly_chart(fig_pace, use_container_width=True)
+
+        # --------- MÉDIAS ANALÍTICAS ---------
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Pace Médio Realizado", formatar_pace(df_pace_real["pace_real_min_km"].mean()) if not df_pace_real.empty else "-")
+        m2.metric("Distância Média por Sessão", f"{df_treinos['distancia_real_km'].mean():.2f} km" if df_treinos["distancia_real_km"].notna().any() else "-")
+        sessoes_concluidas = df_treinos["distancia_real_km"].notna().sum()
+        m3.metric("Sessões Concluídas", f"{int(sessoes_concluidas)}")
 
         st.divider()
 
@@ -632,8 +715,7 @@ with aba_evolucao:
             "data", "nome_treino", "distancia_prescrita_km", "distancia_real_km",
             "Tempo Planejado", "Tempo Realizado", "Pace Planejado", "Pace Realizado", "status",
         ]].rename(columns={
-            "data": "Data",
-            "nome_treino": "Treino",
+            "data": "Data", "nome_treino": "Treino",
             "distancia_prescrita_km": "Dist. Planejada (km)",
             "distancia_real_km": "Dist. Realizada (km)",
             "status": "Status",
@@ -641,6 +723,46 @@ with aba_evolucao:
 
         st.dataframe(
             tabela_exibicao.sort_values("Data", ascending=False),
-            use_container_width=True,
-            hide_index=True,
+            use_container_width=True, hide_index=True,
         )
+
+
+# ============================================================
+# MÓDULO: MUSCULAÇÃO (placeholder — estrutura pronta para o próximo passo)
+# ============================================================
+def render_musculacao() -> None:
+    st.title("🏋️‍♂️ Musculação")
+    tela_diario, tela_evolucao = st.tabs(["📋 Diário", "📈 Evolução"])
+
+    with tela_diario:
+        st.info("Módulo em construção. Aqui entrará o registro diário de treinos de musculação "
+                 "(séries, cargas, repetições) seguindo o mesmo padrão de card comparativo da Corrida.")
+
+    with tela_evolucao:
+        st.info("Módulo em construção. Aqui entrarão os KPIs e gráficos de evolução de carga/volume.")
+
+
+# ============================================================
+# MÓDULO: ALIMENTAÇÃO (placeholder — estrutura pronta para o próximo passo)
+# ============================================================
+def render_alimentacao() -> None:
+    st.title("🥗 Alimentação")
+    tela_diario, tela_evolucao = st.tabs(["📋 Diário", "📈 Evolução"])
+
+    with tela_diario:
+        st.info("Módulo em construção. Aqui entrará o registro diário de refeições/macros.")
+
+    with tela_evolucao:
+        st.info("Módulo em construção. Aqui entrarão os KPIs e gráficos de evolução nutricional.")
+
+
+# ============================================================
+# ROTEAMENTO PRINCIPAL
+# ============================================================
+if pagina == "🏃‍♂️ Corrida":
+    st.title("🏃 Follow Here — Corrida")
+    render_corrida(df_treinos)
+elif pagina == "🏋️‍♂️ Musculação":
+    render_musculacao()
+else:
+    render_alimentacao()
